@@ -5,6 +5,8 @@ mirror_dist_upgrader http://example.com/debian1/
 
 mirror_path http://example.com/debian1/ path1
 ignore_errors http://example.com/debian1/ ignore1
+include http://example.com/debian1/ ginclude1* ginclude2*
+exclude http://example.com/debian1/ gexclude1* gexclude2*
 include_source_name http://example.com/debian1/ isource1
 exclude_source_name http://example.com/debian1/ esource1
 include_binary_packages http://example.com/debian1/ ibinary1
@@ -18,6 +20,8 @@ mirror_dist_upgrader http://example.com/debian2
 
 mirror_path http://example.com/debian2 path2
 ignore_errors http://example.com/debian2 ignore2
+include http://example.com/debian2 ginclude3* ginclude4*
+exclude http://example.com/debian2 gexclude3* gexclude4*
 include_source_name http://example.com/debian2 isource2
 exclude_source_name http://example.com/debian2 esource2
 include_binary_packages http://example.com/debian2 ibinary2

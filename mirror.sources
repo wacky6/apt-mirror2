@@ -53,6 +53,14 @@ Components: [component1] [component2] [...]
 ## Can be an exact file or folder.
 # Ignore-Errors: pool/bullseye/main/g/gitlab-runner/gitlab-runner_14.8.1_amd64.deb
 ##
+## Mirror source or binary packages matching the specified shell-style globs.
+## If not specified, all packages are mirrored.
+# Include: curl* libcurl*
+##
+## Exclude source or binary packages matching the specified shell-style globs.
+## If not specified, no packages are excluded.
+# Exclude: *-doc
+##
 ## Mirror source packages with the specified names and binary packages built from them.
 ## If not specified, all packages are mirrored.
 # Include-Source-Name: source_name1 source_name2 source_name3

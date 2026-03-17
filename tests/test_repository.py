@@ -405,6 +405,76 @@ class TestRepository(BaseTest):
                     files,
                 )
 
+    def test_include(self):
+        for config_kwargs in [
+            {"name": "DebianBookworm", "config_name": "mirror12.list"},
+            {"deb822_names": ("bookworm_mirror12",)},
+        ]:
+            with self.subTest(config_kwargs=config_kwargs):
+                config = self.get_config(**config_kwargs)
+
+                repository = self.ensure_repository(
+                    config.repositories["http://ftp.debian.org/debian"]
+                )
+                repository.mirror_path = Path("repo")
+
+                files = {
+                    d.path
+                    for d in repository.get_pool_files(
+                        self.TEST_DATA / "DebianBookworm", False, True, set()
+                    )
+                }
+
+                self.assertEqual(
+                    {
+                        Path(p)
+                        for p in [
+                            "pool/main/c/curl/curl_7.88.1-10+deb12u5.debian.tar.xz",
+                            "pool/main/c/curl/curl_7.88.1-10+deb12u5.dsc",
+                            "pool/main/c/curl/curl_7.88.1-10+deb12u5_amd64.deb",
+                            "pool/main/c/curl/curl_7.88.1.orig.tar.gz",
+                            "pool/main/c/curl/curl_7.88.1.orig.tar.gz.asc",
+                            "pool/main/c/curl/libcurl4-doc_7.88.1-10+deb12u5_all.deb",
+                            "pool/main/c/curlpp/curlpp_0.8.1-5.1.debian.tar.xz",
+                            "pool/main/c/curlpp/curlpp_0.8.1-5.1.dsc",
+                            "pool/main/c/curlpp/curlpp_0.8.1.orig.tar.gz",
+                            "pool/main/c/curl/libcurl3-gnutls_7.88.1-10+deb12u5_amd64.deb",
+                            "pool/main/c/curl/libcurl3-nss_7.88.1-10+deb12u5_amd64.deb",
+                            "pool/main/c/curl/libcurl4-gnutls-dev_7.88.1-10+deb12u5_amd64.deb",
+                            "pool/main/c/curl/libcurl4-nss-dev_7.88.1-10+deb12u5_amd64.deb",
+                            "pool/main/c/curl/libcurl4-openssl-dev_7.88.1-10+deb12u5_amd64.deb",
+                            "pool/main/c/curl/libcurl4_7.88.1-10+deb12u5_amd64.deb",
+                            "pool/main/c/curlpp/libcurlpp-dev_0.8.1-5.1_amd64.deb",
+                            "pool/main/c/curlpp/libcurlpp0_0.8.1-5.1_amd64.deb",
+                        ]
+                    },
+                    files,
+                )
+
+    def test_exclude(self):
+        for config_kwargs in [
+            {"name": "DebianBookworm", "config_name": "mirror13.list"},
+            {"deb822_names": ("bookworm_mirror13",)},
+        ]:
+            with self.subTest(config_kwargs=config_kwargs):
+                config = self.get_config(**config_kwargs)
+
+                repository = self.ensure_repository(
+                    config.repositories["http://ftp.debian.org/debian"]
+                )
+                repository.mirror_path = Path("repo")
+
+                files = {
+                    d.path.name
+                    for d in repository.get_pool_files(
+                        self.TEST_DATA / "DebianBookworm", False, True, set()
+                    )
+                }
+
+                self.assertIn("curl_7.88.1-10+deb12u5_amd64.deb", files)
+                self.assertIn("0ad_0.0.26-3_amd64.deb", files)
+                self.assertNotIn("libcurl4-doc_7.88.1-10+deb12u5_all.deb", files)
+
     def test_include_sections(self):
         for config_kwargs in [
             {"name": "DebianBookworm", "config_name": "mirror6.list"},

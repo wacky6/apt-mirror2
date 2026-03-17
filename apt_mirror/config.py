@@ -430,6 +430,8 @@ class URLDict(MutableMapping[str, T]):
 
 class Config:
     PACKAGE_FILTERS_KEYS = {
+        "include",
+        "exclude",
         "include_source_name",
         "exclude_source_name",
         "include_binary_packages",

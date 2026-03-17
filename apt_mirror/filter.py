@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+from fnmatch import fnmatchcase
+
 
 class PackageFilter:
     def __init__(self) -> None:
+        self.include: set[str] = set()
+        self.exclude: set[str] = set()
         self.include_source_name: set[str] = set()
         self.exclude_source_name: set[str] = set()
         self.include_binary_packages: set[str] = set()
@@ -19,6 +23,16 @@ class PackageFilter:
         section: str | None = None,
         tags: set[str] | None = None,
     ) -> bool:
+        names = {source_name}
+        if package_name:
+            names.add(package_name)
+
+        if self.include and not self._matches_any_glob(names, self.include):
+            return False
+
+        if self.exclude and self._matches_any_glob(names, self.exclude):
+            return False
+
         if self.include_source_name and source_name not in self.include_source_name:
             return False
 
@@ -62,3 +76,8 @@ class PackageFilter:
 
     def _split_tags(self, tags: set[str]) -> set[str]:
         return tags.union({t.split("::")[0] for t in tags})
+
+    def _matches_any_glob(self, values: set[str], patterns: set[str]) -> bool:
+        return any(
+            fnmatchcase(value, pattern) for value in values for pattern in patterns
+        )
