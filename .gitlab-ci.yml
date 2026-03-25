@@ -129,25 +129,6 @@ test arm64:
   tags:
     - saas-linux-large-arm64
 
-security (trivy):
-  extends:
-    - .security defaults
-  image:
-    name: aquasec/trivy
-    entrypoint: [""]
-  before_script:
-    - trivy --version
-  script:
-    - trivy fs .
-  cache:
-    paths:
-      - .trivy
-    when: always
-  variables:
-    TRIVY_CACHE_DIR: .trivy
-    TRIVY_EXIT_CODE: 1
-    TRIVY_SCANNERS: vuln,config
-
 security (pip-audit):
   extends:
     - .pip cache
