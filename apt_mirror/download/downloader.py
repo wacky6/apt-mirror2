@@ -271,8 +271,10 @@ class Downloader(ABC):
         for variant in source_file.iter_variants():
             expected_size = variant.size
 
+            variant_success = False
             for source_path in variant.get_all_paths():
                 target_path = self._settings.target_root_path / source_path
+                target_path.unlink(missing_ok=True)
 
                 tries = 10
                 while tries > 0:
@@ -290,11 +292,11 @@ class Downloader(ABC):
                             if source_file.ignore_errors or source_file.ignore_missing:
                                 break
 
-                            await retry(
+                            self._log.warning(
                                 f"File {source_path} is missing from server."
-                                " Retrying..."
+                                " Not retrying."
                             )
-                            continue
+                            break
 
                         if response.error:
                             if source_file.ignore_errors:
@@ -343,7 +345,8 @@ class Downloader(ABC):
                                 variant.get_all_paths()
                             )
 
-                            return
+                            variant_success = True
+                            break
 
                         size = 0
                         target_path.unlink(missing_ok=True)
@@ -427,7 +430,18 @@ class Downloader(ABC):
 
                         self._downloaded.append(variant)
                         self._missing_sources.difference_update(variant.get_all_paths())
-                        return
+                        variant_success = True
+                        break
+
+                if variant_success:
+                    break
+
+        if any(
+            v in self._unmodified or v in self._downloaded
+            for v in source_file.compression_variants.values()
+            if len(v.get_all_paths()) > 0
+        ):
+            return
 
         if source_file.ignore_errors:
             self._log.info(f"Unable to download `{source_file.path}`: ignoring")
@@ -437,15 +451,18 @@ class Downloader(ABC):
             self._log.info(f"Optional file `{source_file.path}` is missing on server")
             return
 
+        missing_variants = [
+            v
+            for v in source_file.compression_variants.values()
+            if v not in self._unmodified and v not in self._downloaded
+        ]
         self._missing_sources.update(
-            itertools.chain.from_iterable(
-                v.get_all_paths() for v in source_file.compression_variants.values()
-            )
+            itertools.chain.from_iterable(v.get_all_paths() for v in missing_variants)
         )
 
         if not error:
             self._missing_count += 1
-            self._missing_size += source_file.size
+            self._missing_size += sum(v.size for v in missing_variants)
 
             self._log.warning(
                 f"Unable to download {source_file.path}: file is missing on server"
@@ -453,7 +470,7 @@ class Downloader(ABC):
             return
 
         self._error_count += 1
-        self._error_size += source_file.size
+        self._error_size += sum(v.size for v in missing_variants)
 
         self._log.error(f"Unable to download {source_file.path}: no more tries")
 
