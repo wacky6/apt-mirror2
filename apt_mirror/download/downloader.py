@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import hashlib
 import itertools
 import os
 import shutil
@@ -60,11 +61,19 @@ class DownloaderSettings:
     verify_ca_certificate: bool | str = True
     client_certificate: str | None = None
     client_private_key: str | None = None
+    check_local_hash: bool = False
 
 
 class Downloader(ABC):
     BUFFER_SIZE = 8 * 1024 * 1024
     RETRY_TIMEOUT = 5
+    HASH_READ_SIZE = 8 * 1024 * 1024
+    _HASH_CONSTRUCTORS = {
+        HashType.SHA512: hashlib.sha512,
+        HashType.SHA256: hashlib.sha256,
+        HashType.SHA1: hashlib.sha1,
+        HashType.MD5: hashlib.md5,
+    }
 
     def __init__(self, *, settings: DownloaderSettings):
         self._log = LoggerFactory.get_logger(
@@ -96,6 +105,7 @@ class Downloader(ABC):
         self._downloaded_size = 0
         self._unmodified_count = 0
         self._unmodified_size = 0
+        self._hash_mismatch_count = 0
         self._missing_count = 0
         self._missing_size = 0
         self._error_count = 0
@@ -228,6 +238,50 @@ class Downloader(ABC):
 
         return True
 
+    async def _check_hash(
+        self, path: Path, variants: list[DownloadFileCompressionVariant]
+    ):
+        if not self._settings.check_local_hash:
+            return False
+
+        if not path.is_file():
+            return False
+
+        # No expected hash, assume the check failed to trigger a fresh fetch.
+        if not any(variant.hashes for variant in variants):
+            return False
+
+        path_resolved = path.resolve()
+
+        def _calc_and_verify():
+            for variant in variants:
+                # Prioritize fast hashes
+                for hash_type in (
+                    HashType.SHA256,
+                    HashType.SHA512,
+                    HashType.SHA1,
+                    HashType.MD5,
+                ):
+                    if hash_type not in variant.hashes:
+                        continue
+
+                    if hash_type not in self._HASH_CONSTRUCTORS:
+                        continue
+
+                    checksum = self._HASH_CONSTRUCTORS[hash_type]()
+                    with open(path_resolved, "rb") as fp:
+                        for chunk in iter(lambda: fp.read(self.HASH_READ_SIZE), b""):
+                            checksum.update(chunk)
+
+                    if checksum.hexdigest() == variant.hashes[hash_type].hash:
+                        return True
+            return False
+
+        result = await asyncio.to_thread(_calc_and_verify)
+        if not result:
+            self._hash_mismatch_count += 1
+        return result
+
     async def progress_logger(self):
         while True:
             try:
@@ -245,12 +299,13 @@ class Downloader(ABC):
         )
         self._log.info(
             message
-            + f": {self._downloaded_count} ({format_size(self._downloaded_size)},"
-            f" {download_rate});"
-            " unmodified:"
-            f" {self._unmodified_count} ({format_size(self._unmodified_size)});"
-            f" missing: {self._missing_count} ({format_size(self._missing_size)});"
-            f" errors: {self._error_count} ({format_size(self._error_size)})"
+            + f": {self._downloaded_count} ({format_size(self._downloaded_size)}) "
+            f"{download_rate}"
+            f" hash mismatch: ({self._hash_mismatch_count})"
+            f" unmodified: ({self._unmodified_count})"
+            f" ({format_size(self._unmodified_size)})"
+            f" missing: ({self._missing_count}) ({format_size(self._missing_size)})"
+            f" errors: ({self._error_count}) ({format_size(self._error_size)})"
         )
 
     async def download_file(self, source_file: DownloadFile):
@@ -270,6 +325,33 @@ class Downloader(ABC):
         error = False
         for variant in source_file.iter_variants():
             expected_size = variant.size
+
+            # Check if any path for this variant is valid
+            valid_source_path = None
+            missing_paths = []
+
+            for path in variant.get_all_paths():
+                check_path = self._settings.target_root_path / path
+                if await self._check_hash(check_path, [variant]):
+                    if valid_source_path is None:
+                        valid_source_path = check_path
+                else:
+                    missing_paths.append(check_path)
+
+            if valid_source_path:
+                # We have at least one valid copy.
+                # Self-heal: If some paths are missing/invalid, restore them.
+                if missing_paths:
+                    self.link_or_copy(valid_source_path, *missing_paths)
+                    self._log.info(
+                        f"Self-healed {len(missing_paths)} missing paths from "
+                        f"{valid_source_path}"
+                    )
+
+                self._unmodified_count += 1
+                self._unmodified_size += variant.size
+                self._unmodified.append(variant)
+                continue
 
             variant_success = False
             for source_path in variant.get_all_paths():
