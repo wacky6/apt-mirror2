@@ -34,10 +34,15 @@ class TestVerifyHashCheck(BaseTest):
 
         # Mock Settings
         settings = MagicMock(spec=DownloaderSettings)
-        settings.check_local_hash = True
-        settings.target_root_path = self.tmp_dir
         settings.url = "http://example.com"
         settings.semaphore = asyncio.Semaphore(1)
+        settings.check_hashes = {
+            HashType.MD5,
+            HashType.SHA256,
+            HashType.SHA512,
+            HashType.SHA1,
+        }
+        settings.check_local_hash = True
 
         # Mock Downloader
         class TestDownloader(Downloader):
@@ -117,6 +122,12 @@ class TestVerifyHashCheck(BaseTest):
         settings.target_root_path = self.tmp_dir
         settings.url = "http://example.com"
         settings.semaphore = asyncio.Semaphore(1)
+        settings.check_hashes = {
+            HashType.MD5,
+            HashType.SHA256,
+            HashType.SHA512,
+            HashType.SHA1,
+        }
         # Mock aiofile factory to support open
         # (needed if download triggers,
         # but we expect it NOT to trigger network download)
@@ -186,10 +197,16 @@ class TestVerifyHashCheck(BaseTest):
 
         # Mock Settings
         settings = MagicMock(spec=DownloaderSettings)
-        settings.check_local_hash = False
-        settings.target_root_path = self.tmp_dir
         settings.url = "http://example.com"
         settings.semaphore = asyncio.Semaphore(1)
+        settings.check_hashes = {
+            HashType.MD5,
+            HashType.SHA256,
+            HashType.SHA512,
+            HashType.SHA1,
+        }
+        settings.check_local_hash = False
+        settings.target_root_path = self.tmp_dir
 
         # We need a mock aiofile factory that records what paths were opened
         opened_paths = []

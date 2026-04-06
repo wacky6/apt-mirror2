@@ -93,6 +93,10 @@ class Downloader(ABC):
         self._missing_sources: set[Path] = set()
         self._download_start = datetime.now()
 
+        # Set of algorithms that returned 404 for by-hash fetching.
+        # This is a session-level cache to minimize expensive network requests.
+        self._unsupported_by_hash_algos: set[HashType] = set()
+
         self.reset_stats()
 
         self.__post_init__()
@@ -354,11 +358,20 @@ class Downloader(ABC):
                 continue
 
             variant_success = False
-            for source_path in variant.get_all_paths():
+            source_paths = variant.get_prioritized_source_paths(
+                self._settings.check_hashes, self._unsupported_by_hash_algos
+            )
+
+            for source_path in source_paths:
                 target_path = self._settings.target_root_path / source_path
                 target_path.unlink(missing_ok=True)
 
                 tries = 10
+                # If we have more than one source path, we treat individual failures
+                # more gracefully and don't retry as aggressively for
+                # "skip-able" errors.
+                is_last_source_path = source_path == source_paths[-1]
+
                 while tries > 0:
                     async with (
                         self._settings.semaphore,
@@ -371,13 +384,40 @@ class Downloader(ABC):
                             continue
 
                         if response.missing:
+                            # Dynamic Algorithm Discovery:
+                            # If it's a by-hash path and it missing, blacklist this
+                            # algorithm for this repository session to avoid future
+                            # expensive 404s.
+                            if "by-hash" in source_path.parts:
+                                # Extract algorithm from path:
+                                # parent/by-hash/<alg>/<hash>
+                                try:
+                                    algo_index = source_path.parts.index("by-hash") + 1
+                                    algo_name = source_path.parts[algo_index]
+                                    for ht in HashType:
+                                        if ht.value == algo_name:
+                                            self._unsupported_by_hash_algos.add(ht)
+                                            self._log.debug(
+                                                f"By-hash algorithm {ht.value} "
+                                                "blacklisted (received 404)."
+                                            )
+                                            break
+                                except (ValueError, IndexError):
+                                    pass
+
                             if source_file.ignore_errors or source_file.ignore_missing:
                                 break
 
-                            self._log.warning(
-                                f"File {source_path} is missing from server."
-                                " Not retrying."
-                            )
+                            if is_last_source_path:
+                                self._log.warning(
+                                    f"File {source_path} is missing from server."
+                                    " Not retrying."
+                                )
+                            else:
+                                self._log.debug(
+                                    f"File {source_path} is missing from server. "
+                                    "Trying next available path."
+                                )
                             break
 
                         if response.error:
@@ -481,6 +521,22 @@ class Downloader(ABC):
                                             calculated_hash,
                                         )
 
+                            except HashMismatchException:
+                                if is_last_source_path:
+                                    await retry(
+                                        f"Hash mismatch occurred while downloading "
+                                        f"file {source_path}. Retrying..."
+                                    )
+                                    error = True
+                                    continue
+                                else:
+                                    self._log.debug(
+                                        f"Hash mismatch for {source_path}. "
+                                        "Trying next available path."
+                                    )
+                                    # Break to try next source_path
+                                    break
+
                             except Exception as ex:  # pylint: disable=W0718
                                 await retry(
                                     f"An error `{ex.__class__.__qualname__}: {ex}`"
@@ -491,10 +547,18 @@ class Downloader(ABC):
                                 continue
 
                         if expected_size > 0 and expected_size != size:
-                            await retry(
-                                f"Downloaded size {size} is differs from expected size"
-                                f" {expected_size} for file {source_path}. Retrying..."
-                            )
+                            if is_last_source_path:
+                                await retry(
+                                    f"Downloaded size {size} differs from expected "
+                                    f"size {expected_size} for file {source_path}. "
+                                    "Retrying..."
+                                )
+                            else:
+                                self._log.debug(
+                                    f"Size mismatch for {source_path}. "
+                                    "Trying next available path."
+                                )
+                                break
                             error = True
                             continue
 
