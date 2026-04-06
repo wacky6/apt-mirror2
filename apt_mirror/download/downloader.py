@@ -176,8 +176,10 @@ class Downloader(ABC):
         while self._sources:
             source_file = self._sources.pop()
 
-            file_unmodified = False
+            all_variants_unmodified = False
             if source_file.check_size:
+                all_variants_unmodified = True
+                unmodified_variants = []
                 for variant in source_file.iter_variants():
                     target_path = (
                         self._settings.target_root_path / variant.get_source_path()
@@ -185,17 +187,20 @@ class Downloader(ABC):
 
                     try:
                         stat = target_path.stat()
-                        if stat.st_size == source_file.size:
-                            self._unmodified_count += 1
-                            self._unmodified_size += source_file.size
-                            self._unmodified.append(variant)
-
-                            file_unmodified = True
-                            break
+                        if stat.st_size == variant.size:
+                            unmodified_variants.append(variant)
+                        else:
+                            all_variants_unmodified = False
                     except FileNotFoundError:
-                        pass
+                        all_variants_unmodified = False
 
-            if file_unmodified:
+                if all_variants_unmodified:
+                    for variant in unmodified_variants:
+                        self._unmodified_count += 1
+                        self._unmodified_size += variant.size
+                        self._unmodified.append(variant)
+
+            if all_variants_unmodified:
                 continue
 
             tasks.add(asyncio.create_task(self.download_file(source_file)))
