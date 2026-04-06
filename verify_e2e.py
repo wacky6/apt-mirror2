@@ -1,0 +1,247 @@
+import shutil
+import subprocess
+from pathlib import Path
+
+# Config
+REPO_URL = "deb http://nginx.org/packages/ubuntu/ noble nginx"
+TMP_DIR = Path("./tmp_verify")
+MIRROR_LIST = TMP_DIR / "mirror.list"
+BASE_PATH = TMP_DIR / "base"
+MIRROR_PATH = BASE_PATH / "mirror"
+SKEL_PATH = BASE_PATH / "skel"
+VAR_PATH = BASE_PATH / "var"
+
+
+def setup():
+    if TMP_DIR.exists():
+        shutil.rmtree(TMP_DIR)
+    TMP_DIR.mkdir()
+    BASE_PATH.mkdir()
+
+    config_content = f"""
+set base_path    {BASE_PATH.absolute()}
+set mirror_path  {MIRROR_PATH.absolute()}
+set skel_path    {SKEL_PATH.absolute()}
+set var_path     {VAR_PATH.absolute()}
+set nthreads     5
+set _autoclean   0
+set check_local_hash 1
+
+include_binary_packages http://nginx.org/packages/ubuntu/ nginx
+
+{REPO_URL}
+"""
+    with open(MIRROR_LIST, "w") as f:
+        f.write(config_content)
+    print(f"Created config at {MIRROR_LIST}")
+
+
+def run_sync(label):
+    print(f"\n--- Running Sync: {label} ---")
+
+    # Using python -m to run
+    cmd = ["python3", "-m", "apt_mirror.apt_mirror", str(MIRROR_LIST)]
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,  # Line buffered
+    )
+
+    stdout_lines = []
+    stderr_lines = []
+
+    import threading
+
+    def stream_reader(pipe, dest_list, prefix=""):
+        for line in pipe:
+            print(f"{prefix}{line}", end="")
+            dest_list.append(line)
+
+    t1 = threading.Thread(
+        target=stream_reader, args=(process.stdout, stdout_lines, "[OUT] ")
+    )
+    t2 = threading.Thread(
+        target=stream_reader, args=(process.stderr, stderr_lines, "[ERR] ")
+    )
+
+    t1.start()
+    t2.start()
+
+    process.wait()
+    t1.join()
+    t2.join()
+
+    full_stderr = "".join(stderr_lines)
+    full_stdout = "".join(stdout_lines)
+
+    # Filter logs for hash verification
+    logging_lines = [
+        line for line in stderr_lines
+    ]  # Capture all log lines for checking
+
+    # Look for status lines or specific events.
+    # Return all logging lines so verify() can parse different things
+    # (downloads, mismatches etc) properly without pre-filtering too aggressively.
+    logs_to_return = logging_lines
+
+    # Fake a result object for compatibility
+    class Result:
+        pass
+
+    result = Result()
+    result.returncode = process.returncode
+    result.stdout = full_stdout
+    result.stderr = full_stderr
+
+    if result.returncode != 0:
+        pass  # Already printed via stream
+
+    return result, logs_to_return, result.stderr
+
+
+def verify():
+    setup()
+
+    # 1. Initial Sync
+    res1, logs1, stderr1 = run_sync("Initial Sync")
+    if res1.returncode != 0:
+        print("Initial sync failed!")
+        return
+
+    # Find loose debs
+    deb_files = list(MIRROR_PATH.rglob("*.deb"))
+    print(f"Downloaded {len(deb_files)} deb files.")
+    if len(deb_files) == 0:
+        print("DEBUG: contents of var path:")
+        if VAR_PATH.exists():
+            for log_file in VAR_PATH.iterdir():
+                print(f"--- Log: {log_file.name} ---")
+                if log_file.is_file():
+                    print(log_file.read_text())
+        else:
+            print(f"DEBUG: var path {VAR_PATH} does not exist.")
+            print("DEBUG: STDOUT:")
+            print(res1.stdout)
+            print("DEBUG: STDERR:")
+            print(res1.stderr)
+
+    if len(deb_files) < 3:
+        print("Not enough files downloaded to verify!")
+        return
+
+    # 2. Modify State
+    file_to_corrupt = deb_files[0]
+    file_to_delete = deb_files[1]
+
+    print(f"Corrupting: {file_to_corrupt.name}")
+    with open(file_to_corrupt, "r+b") as f:
+        f.seek(0)
+        f.write(b"CORRUPT")
+
+    print(f"Deleting: {file_to_delete.name}")
+    file_to_delete.unlink()
+
+    # 3. Second Sync
+    res2, logs2, stderr2 = run_sync("Second Sync (Corruption & Deletion)")
+
+    # Analysis
+    print("\n--- Verification Analysis ---")
+
+    # Check for "Hash mismatch [...]" in logs.
+    # Corrupted file -> Should trigger mismatch increment.
+    # Deleted file -> No check -> No mismatch increment.
+    # Unchanged -> Match -> No mismatch increment.
+    # Total mismatch count should be 1.
+
+    mismatch_counts = []
+    for line in logs2:
+        # Old Format: ... Hash mismatch [1] ...
+        # New Format: ... hash mismatch: (1) ...
+        try:
+            lower_line = line.lower()
+            if "hash mismatch: (" in lower_line:
+                part = lower_line.split("hash mismatch: (")[1].split(")")[0]
+                mismatch_counts.append(int(part))
+            elif "hash mismatch [" in line:
+                part = line.split("Hash mismatch [")[1].split("]")[0]
+                mismatch_counts.append(int(part))
+        except (IndexError, ValueError):
+            pass
+
+    print(f"Mismatch counts found: {mismatch_counts}")
+
+    if mismatch_counts:
+        final_count = mismatch_counts[-1]
+        print(f"Final mismatch count: {final_count}")
+        if final_count == 1:
+            print(
+                "PASS: Exactly 1 hash mismatch detected "
+                "(corresponding to the corrupted file)."
+            )
+        elif final_count > 1:
+            print(f"FAIL: Too many mismatches ({final_count}). Did deleted file count?")
+        else:
+            print("FAIL: No mismatches detected.")
+    else:
+        print("FAIL: No 'hash mismatch' log found.")
+
+    # Check downloads
+    downloaded_counts = []
+    for line in logs2:
+        # Format: Download finished: N ...
+        if "Download finished:" in line:
+            try:
+                # "Download finished: 2 (..."
+                part = line.split("Download finished:")[1].strip().split(" ")[0]
+                downloaded_counts.append(int(part))
+            except (IndexError, ValueError):
+                pass
+
+    print(f"Downloaded counts found: {downloaded_counts}")
+    if downloaded_counts:
+        last_count = downloaded_counts[-1]
+        if last_count > 0:
+            print(f"PASS: {last_count} files re-downloaded.")
+        else:
+            print("FAIL: No files re-downloaded.")
+
+        # 4. Check Log Format for Unit Fix
+        # We want to ensure total size does NOT have /s suffix in parentheses.
+        # Log example: ... (123.4 KiB) 10.0 MiB/sec ...
+        # Bad log: ... (123.4 KiB/s) ...
+        found_bad_unit = False
+        for line in logs2:
+            if "Download finished:" in line:
+                # Check for the pattern " (X B/s)" or similar where it shouldn't be.
+                # Actually, simpler: verify the structure using regex or simple split.
+                # The log format is: ... {count} ({size}) {rate} ...
+                # Let's just find the first parenthesis block
+                # after "Download finished: N"
+                try:
+                    parts = line.split("Download finished:")[1]
+                    # parts = " 2 (25.8 KiB) 110.6 KiB/sec hash mismatch: ..."
+                    # Extract (25.8 KiB)
+                    first_paren = parts.split("(")[1].split(")")[0]
+                    if "/s" in first_paren or "/sec" in first_paren:
+                        found_bad_unit = True
+                        print(
+                            f"FAIL: Found incorrect unit in size logging: "
+                            f"({first_paren}) in line: {line.strip()}"
+                        )
+                except Exception:
+                    pass
+
+        if not found_bad_unit:
+            print("PASS: Logging unit format appears correct (no /s in size).")
+        else:
+            print("FAIL: Logging unit format incorrect.")
+
+    else:
+        print("FAIL: No download status log found.")
+
+
+if __name__ == "__main__":
+    verify()
