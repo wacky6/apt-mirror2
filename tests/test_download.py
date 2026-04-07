@@ -256,3 +256,45 @@ class TestDownloader(IsolatedAsyncioTestCase):
                 (downloader.get_target_root_path() / file_path).read_bytes(),
                 content_bytes,
             )
+
+    async def test_sum_file_hash_cache(self):
+        file_path = Path("dists/test/InRelease")
+        content: tuple[bytes] = self.CONTENTS[0]["data"]
+        content_hashes: set[HashSum] = self.CONTENTS[0]["hashes"]
+        content_bytes = b"".join(content)
+
+        expected_sha256 = next(
+            h for h in content_hashes if h.type == HashType.SHA256
+        ).hash
+
+        with self.get_downloader(check_hashes={HashType.SHA256}) as downloader:
+            downloader.set_response(*content)
+
+            source_file = self.get_download_file(
+                file_path,
+                len(content_bytes),
+                content_hashes,
+            )
+
+            downloader._settings.check_local_hash = True
+
+            # 1. Fresh download - file missing -> downloads -> sets sum file
+            await downloader.download_file(source_file)
+            self.assertEqual(downloader.downloaded_files_count, 1)
+
+            # verify sum file was created with correct content
+            target_path = downloader._settings.target_root_path / file_path
+            sum_path = target_path.parent / f".{target_path.name}.sum"
+            self.assertTrue(sum_path.exists())
+            self.assertIn(f"sha256:{expected_sha256.lower()}", sum_path.read_text())
+
+            # 2. Local check cache hit
+            downloader.reset_stats()
+            # The file is physically on disk now, and the sum file matches.
+
+            await downloader.download_file(source_file)
+
+            # check_local_hash=True and sum matches, so it skips the download.
+            # unmodified files + 1
+            self.assertEqual(downloader.unmodified_files_count, 1)
+            self.assertEqual(downloader.downloaded_files_count, 0)
