@@ -135,7 +135,10 @@ class TestRepository(BaseTest):
         metadata_files = set(
             d.path.relative_to(Path("dists/test"))
             for d in repository.get_metadata_files(
-                self.TEST_DATA / "DebianArchiveBusterProposedUpdates", False, set()
+                self.TEST_DATA / "DebianArchiveBusterProposedUpdates",
+                self.TEST_DATA / "DebianArchiveBusterProposedUpdates",
+                False,
+                set(),
             )
         )
 
@@ -161,7 +164,10 @@ class TestRepository(BaseTest):
         metadata_files = set(
             d.path.relative_to(Path("dists/test"))
             for d in repository.get_metadata_files(
-                self.TEST_DATA / "DebianArchiveBusterProposedUpdates", False, set()
+                self.TEST_DATA / "DebianArchiveBusterProposedUpdates",
+                self.TEST_DATA / "DebianArchiveBusterProposedUpdates",
+                False,
+                set(),
             )
         )
 
@@ -183,7 +189,10 @@ class TestRepository(BaseTest):
         metadata_files = set(
             d.path.relative_to(Path("dists/test"))
             for d in repository.get_metadata_files(
-                self.TEST_DATA / "DebianBookworm", False, set()
+                self.TEST_DATA / "DebianBookworm",
+                self.TEST_DATA / "DebianBookworm",
+                False,
+                set(),
             )
         )
 
@@ -209,7 +218,10 @@ class TestRepository(BaseTest):
         metadata_files = set(
             d.path.relative_to(Path("dists/test"))
             for d in repository.get_metadata_files(
-                self.TEST_DATA / "DebianBookworm", False, set()
+                self.TEST_DATA / "DebianBookworm",
+                self.TEST_DATA / "DebianBookworm",
+                False,
+                set(),
             )
         )
 
@@ -235,7 +247,10 @@ class TestRepository(BaseTest):
 
         try:
             repository.get_metadata_files(
-                self.TEST_DATA / "BinaryGPGReleaseFile", False, set()
+                self.TEST_DATA / "BinaryGPGReleaseFile",
+                self.TEST_DATA / "BinaryGPGReleaseFile",
+                False,
+                set(),
             )
         except UnicodeDecodeError:
             self.fail(
@@ -632,7 +647,10 @@ class TestRepository(BaseTest):
         files = set(
             f.path
             for f in repository.get_metadata_files(
-                self.TEST_DATA / "MixedConfig", False, set()
+                self.TEST_DATA / "MixedConfig",
+                self.TEST_DATA / "MixedConfig",
+                False,
+                set(),
             )
         )
 
@@ -662,7 +680,10 @@ class TestRepository(BaseTest):
         files = set(
             f.path
             for f in repository.get_metadata_files(
-                self.TEST_DATA / "MixedConfig", False, set()
+                self.TEST_DATA / "MixedConfig",
+                self.TEST_DATA / "MixedConfig",
+                False,
+                set(),
             )
         )
 
@@ -726,7 +747,10 @@ class TestRepository(BaseTest):
             files = [
                 str(f.path)
                 for f in repository.get_metadata_files(
-                    self.TEST_DATA / "MaliciousRepository", False, set()
+                    self.TEST_DATA / "MaliciousRepository",
+                    self.TEST_DATA / "MaliciousRepository",
+                    False,
+                    set(),
                 )
             ]
 

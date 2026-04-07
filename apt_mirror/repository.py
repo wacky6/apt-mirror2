@@ -570,7 +570,11 @@ class BaseRepository(ABC):
         return path.with_name(f"{path.name}.sh")
 
     def get_metadata_files(
-        self, repository_root: Path, encode_tilde: bool, missing_sources: set[Path]
+        self,
+        repository_root: Path,
+        repository_mirror: Path,
+        encode_tilde: bool,
+        missing_sources: set[Path]
     ) -> set[DownloadFile]:
         metadata_files: set[DownloadFile] = set()
         mirror_path = repository_root / self.get_mirror_path(encode_tilde)
@@ -595,6 +599,32 @@ class BaseRepository(ABC):
 
                 with open(release_file, "rt", encoding="utf-8") as fp:
                     release = Release(fp)
+
+                old_release_file = (
+                    repository_mirror
+                    / self.get_mirror_path(encode_tilde)
+                    / release_file_relative_path
+                )
+                old_hashes = {}
+                if old_release_file.exists():
+                    try:
+                        with open(old_release_file, "rt", encoding="utf-8") as old_fp:
+                            old_release = Release(old_fp)
+                            for hash_type in HashType:
+                                for file in old_release.get(hash_type.value, []):
+                                    try:
+                                        old_hashes[
+                                            (
+                                                hash_type,
+                                                file["name"],
+                                                int(file["size"]),
+                                                file[hash_type.value],
+                                            )
+                                        ] = True
+                                    except (ValueError, KeyError):
+                                        continue
+                    except Exception:
+                        pass
 
                 use_hash = release.get("Acquire-By-Hash") == "yes"
                 if use_hash:
@@ -630,6 +660,23 @@ class BaseRepository(ABC):
 
                         repository_path = release_file_relative_path.parent / path
                         uncompressed_path = DownloadFile.uncompressed_path(path)
+                        
+                        known_unmodified = False
+                        if (hash_type, str(path), size, hash_sum.hash) in old_hashes:
+                            known_unmodified = True
+                            
+                            old_file_path = (
+                                repository_mirror
+                                / self.get_mirror_path(encode_tilde)
+                                / repository_path
+                            )
+                            new_file_path = mirror_path / repository_path
+                            if old_file_path.exists():
+                                from .download.downloader import Downloader
+                                Downloader.link_or_copy(old_file_path, new_file_path)
+                            else:
+                                known_unmodified = False
+                                
                         if uncompressed_path in codename_metadata_files:
                             codename_metadata_files[
                                 uncompressed_path
@@ -638,6 +685,7 @@ class BaseRepository(ABC):
                                 size=size,
                                 hash_sum=hash_sum,
                                 use_by_hash=use_hash,
+                                known_unmodified=known_unmodified,
                             )
                         else:
                             codename_metadata_files[uncompressed_path] = (
@@ -646,6 +694,7 @@ class BaseRepository(ABC):
                                     size=size,
                                     hash_sum=hash_sum,
                                     use_by_hash=use_hash,
+                                    known_unmodified=known_unmodified,
                                 )
                             )
 
@@ -957,10 +1006,14 @@ class Repository(BaseRepository):
     codenames: Codenames
 
     def get_metadata_files(
-        self, repository_root: Path, encode_tilde: bool, missing_sources: set[Path]
+        self,
+        repository_root: Path,
+        repository_mirror: Path,
+        encode_tilde: bool,
+        missing_sources: set[Path]
     ) -> set[DownloadFile]:
         metadata_files = super().get_metadata_files(
-            repository_root, encode_tilde, missing_sources
+            repository_root, repository_mirror, encode_tilde, missing_sources
         )
 
         if not self.mirror_dist_upgrader:

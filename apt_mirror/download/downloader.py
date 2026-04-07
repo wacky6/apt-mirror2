@@ -366,7 +366,9 @@ class Downloader(ABC):
 
             for path in variant.get_all_paths():
                 check_path = self._settings.target_root_path / path
-                if await self._check_hash(check_path, [variant]):
+                if (
+                    variant.known_unmodified and check_path.exists()
+                ) or await self._check_hash(check_path, [variant]):
                     if valid_source_path is None:
                         valid_source_path = check_path
                 else:

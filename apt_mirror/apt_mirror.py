@@ -425,6 +425,7 @@ class RepositoryMirror:
     async def download_metadata_files(self) -> Iterable[DownloadFile]:
         metadata_files = self._repository.get_metadata_files(
             self._config.skel_path,
+            self._config.mirror_path,
             self._config.encode_tilde,
             self._downloader.get_missing_sources(),
         )

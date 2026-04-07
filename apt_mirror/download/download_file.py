@@ -86,6 +86,7 @@ class DownloadFileCompressionVariant:
     size: int
     hashes: dict[HashType, HashSum]
     use_by_hash: bool
+    known_unmodified: bool = False
 
     def _get_hashed_path(self, hash_type: HashType):
         return (
@@ -183,6 +184,7 @@ class DownloadFile:
         size: int,
         hash_sum: HashSum,
         use_by_hash: bool,
+        known_unmodified: bool = False,
     ):
         download_file = DownloadFile.from_path(cls.uncompressed_path(path))
         download_file.add_compression_variant(
@@ -190,6 +192,7 @@ class DownloadFile:
             size=size,
             hash_sum=hash_sum,
             use_by_hash=use_by_hash,
+            known_unmodified=known_unmodified,
         )
 
         return download_file
@@ -204,6 +207,7 @@ class DownloadFile:
         size: int,
         hash_sum: HashSum | None = None,
         use_by_hash: bool = False,
+        known_unmodified: bool = False,
     ):
         hashes: dict[HashType, HashSum] = {}
         if hash_sum:
@@ -226,6 +230,7 @@ class DownloadFile:
                 size=size,
                 hashes=hashes,
                 use_by_hash=use_by_hash,
+                known_unmodified=known_unmodified,
             ),
         )
 
@@ -233,6 +238,7 @@ class DownloadFile:
         compression_variant.size = size
         compression_variant.use_by_hash = use_by_hash
         compression_variant.hashes.update(hashes)
+        compression_variant.known_unmodified = known_unmodified
 
     def iter_variants(self):
         for compression in FileCompression:

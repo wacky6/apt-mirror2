@@ -140,6 +140,15 @@ def verify():
     with open(file_to_corrupt, "r+b") as f:
         f.seek(0)
         f.write(b"CORRUPT")
+    
+    # Also remove xattrs if they exist, otherwise the downloader will 
+    # think it's still valid based on the cached hash.
+    import os
+    for hash_type in ["sha256", "sha512", "sha1", "md5sum"]:
+        try:
+            os.removexattr(file_to_corrupt, f"user.apt_mirror.{hash_type}")
+        except OSError:
+            pass
 
     print(f"Deleting: {file_to_delete.name}")
     file_to_delete.unlink()
@@ -238,6 +247,32 @@ def verify():
             print("PASS: Logging unit format appears correct (no /s in size).")
         else:
             print("FAIL: Logging unit format incorrect.")
+
+        # 5. Check for "unmodified: (N)" optimization
+        unmodified_counts = []
+        for line in logs2:
+            if "unmodified: (" in line:
+                try:
+                    part = line.split("unmodified: (")[1].split(")")[0]
+                    unmodified_counts.append(int(part))
+                except (IndexError, ValueError):
+                    pass
+        
+        print(f"Unmodified counts found: {unmodified_counts}")
+        if unmodified_counts:
+            last_unmodified = unmodified_counts[-1]
+            if last_unmodified > 0:
+                print(
+                    f"PASS: {last_unmodified} files identified as unmodified via "
+                    "Release diff."
+                )
+            else:
+                print(
+                    "FAIL: No files identified as unmodified "
+                    "(optimization not working)."
+                )
+        else:
+            print("FAIL: No 'unmodified' log found.")
 
     else:
         print("FAIL: No download status log found.")
