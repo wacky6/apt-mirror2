@@ -97,8 +97,16 @@ class PathCleaner:
         file_size = path.stat().st_size
         self._bytes_total += file_size
 
-        if path.relative_to(self._root_path) in self._keep_files:
+        relative_path = path.relative_to(self._root_path)
+        if relative_path in self._keep_files:
             return True
+
+        # Check if it's a .sum file for a kept file
+        if path.name.startswith(".") and path.name.endswith(".sum"):
+            owner_name = path.name[1:-4]
+            owner_path = relative_path.with_name(owner_name)
+            if owner_path in self._keep_files:
+                return True
 
         self._bytes_cleaned += file_size
         self._files_queue.append(path)

@@ -31,6 +31,46 @@ from .slow_rate_protector import SlowRateProtectorFactory
 from .url import URL
 
 
+def read_sum(path: Path) -> dict[HashType, str]:
+    try:
+        sum_path = path.parent / f".{path.name}.sum"
+        if not sum_path.exists():
+            return {}
+
+        sums = {}
+        type_map = {ht.value.lower(): ht for ht in HashType}
+
+        with open(sum_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if ":" in line:
+                    k, v = line.strip().split(":", 1)
+                    k_lower = k.lower()
+                    if k_lower in type_map:
+                        sums[type_map[k_lower]] = v.lower()
+        return sums
+    except Exception:  # pylint: disable=W0718
+        pass
+    return {}
+
+
+def store_sum(path: Path, hash_type: HashType, hex_digest: str):
+    try:
+        sum_path = path.parent / f".{path.name}.sum"
+        sums = {}
+        if sum_path.exists():
+            with open(sum_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if ":" in line:
+                        k, v = line.strip().split(":", 1)
+                        sums[k.lower()] = v.lower()
+        sums[hash_type.value.lower()] = hex_digest.lower()
+        with open(sum_path, "w", encoding="utf-8") as f:
+            for k, v in sums.items():
+                f.write(f"{k}:{v}\n")
+    except Exception:  # pylint: disable=W0718
+        pass
+
+
 class HashMismatchException(Exception):
     def __init__(
         self, hash_type: HashType, path: Path, expected: str, calculated: str
@@ -258,6 +298,21 @@ class Downloader(ABC):
         path_resolved = path.resolve()
 
         def _calc_and_verify():
+            cached_sums_lwr = read_sum(path_resolved)
+            for variant in variants:
+                for hash_type in (
+                    HashType.SHA256,
+                    HashType.SHA512,
+                    HashType.SHA1,
+                    HashType.MD5,
+                ):
+                    if hash_type not in variant.hashes:
+                        continue
+
+                    cached_sum_lwr = cached_sums_lwr.get(hash_type, "")
+                    if cached_sum_lwr == variant.hashes[hash_type].hash.lower():
+                        return True
+
             for variant in variants:
                 # Prioritize fast hashes
                 for hash_type in (
@@ -277,7 +332,9 @@ class Downloader(ABC):
                         for chunk in iter(lambda: fp.read(self.HASH_READ_SIZE), b""):
                             checksum.update(chunk)
 
-                    if checksum.hexdigest() == variant.hashes[hash_type].hash:
+                    checksum_hex_lwr = checksum.hexdigest().lower()
+                    if checksum_hex_lwr == variant.hashes[hash_type].hash.lower():
+                        store_sum(path_resolved, hash_type, checksum_hex_lwr)
                         return True
             return False
 
@@ -561,6 +618,12 @@ class Downloader(ABC):
                                 break
                             error = True
                             continue
+
+                        with open(target_path, "a") as f:
+                            os.fsync(f.fileno())
+
+                        for hash_type, hash_function in hashes.items():
+                            store_sum(target_path, hash_type, hash_function.hexdigest())
 
                         if response.date:
                             os.utime(
