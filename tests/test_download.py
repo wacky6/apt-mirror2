@@ -256,3 +256,50 @@ class TestDownloader(IsolatedAsyncioTestCase):
                 (downloader.get_target_root_path() / file_path).read_bytes(),
                 content_bytes,
             )
+
+    @patch("apt_mirror.download.downloader.os.setxattr", create=True)
+    @patch("apt_mirror.download.downloader.os.getxattr", create=True)
+    async def test_xattr_hash_cache(self, mock_getxattr, mock_setxattr):
+        file_path = Path("dists/test/InRelease")
+        content: tuple[bytes] = self.CONTENTS[0]["data"]
+        content_hashes: set[HashSum] = self.CONTENTS[0]["hashes"]
+        content_bytes = b"".join(content)
+
+        expected_sha256 = next(
+            h for h in content_hashes if h.type == HashType.SHA256
+        ).hash
+
+        with self.get_downloader(check_hashes={HashType.SHA256}) as downloader:
+            downloader.set_response(*content)
+
+            source_file = self.get_download_file(
+                file_path,
+                len(content_bytes),
+                content_hashes,
+            )
+
+            downloader._settings.check_local_hash = True
+
+            # 1. Fresh download - file missing -> downloads -> sets xattr
+            await downloader.download_file(source_file)
+            self.assertEqual(downloader.downloaded_files_count, 1)
+
+            # verify setxattr was called with correct arguments
+            target_path = downloader._settings.target_root_path / file_path
+            mock_setxattr.assert_any_call(
+                target_path, "user.apt_mirror.sha256", expected_sha256.encode("utf-8")
+            )
+
+            # 2. Local check cache hit
+            downloader.reset_stats()
+            # The file is physically on disk now, so path.is_file() == True.
+            # We simulate getxattr returning a match
+            mock_getxattr.return_value = expected_sha256.encode("utf-8")
+
+            await downloader.download_file(source_file)
+
+            # check_local_hash=True and xattr matches, so it skips the download.
+            # unmodified files + 1
+            self.assertEqual(downloader.unmodified_files_count, 1)
+            self.assertEqual(downloader.downloaded_files_count, 0)
+            mock_getxattr.assert_called()

@@ -259,6 +259,27 @@ class Downloader(ABC):
 
         def _calc_and_verify():
             for variant in variants:
+                for hash_type in (
+                    HashType.SHA256,
+                    HashType.SHA512,
+                    HashType.SHA1,
+                    HashType.MD5,
+                ):
+                    if hash_type not in variant.hashes:
+                        continue
+
+                    try:
+                        xattr_name = f"user.apt_mirror.{hash_type.value.lower()}"
+                        cached_xattr = os.getxattr(path_resolved, xattr_name)
+                        if (
+                            cached_xattr.decode("utf-8").lower()
+                            == variant.hashes[hash_type].hash.lower()
+                        ):
+                            return True
+                    except OSError:
+                        pass
+
+            for variant in variants:
                 # Prioritize fast hashes
                 for hash_type in (
                     HashType.SHA256,
@@ -278,6 +299,15 @@ class Downloader(ABC):
                             checksum.update(chunk)
 
                     if checksum.hexdigest() == variant.hashes[hash_type].hash:
+                        try:
+                            xattr_name = f"user.apt_mirror.{hash_type.value.lower()}"
+                            os.setxattr(
+                                path_resolved,
+                                xattr_name,
+                                checksum.hexdigest().encode("utf-8"),
+                            )
+                        except OSError:
+                            pass
                         return True
             return False
 
@@ -561,6 +591,22 @@ class Downloader(ABC):
                                 break
                             error = True
                             continue
+
+                        with open(target_path, "a") as f:
+                            os.fsync(f.fileno())
+
+                        for hash_type, hash_function in hashes.items():
+                            try:
+                                xattr_name = (
+                                    f"user.apt_mirror.{hash_type.value.lower()}"
+                                )
+                                os.setxattr(
+                                    target_path,
+                                    xattr_name,
+                                    hash_function.hexdigest().lower().encode("utf-8"),
+                                )
+                            except OSError:
+                                pass
 
                         if response.date:
                             os.utime(
