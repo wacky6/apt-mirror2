@@ -122,6 +122,16 @@ except ImportError:
             return await self._fd.write(data)
 
     class AsyncIOFileFactory(BaseAsyncIOFileWriterFactory):
+        async def test_storage(self, *test_paths: Path) -> None:
+            for path in test_paths:
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    async with self.open(path) as fp:
+                        await fp.write(b" ")
+                finally:
+                    with contextlib.suppress(OSError):
+                        path.unlink(missing_ok=True)
+
         @asynccontextmanager
         async def open(self, path: Path) -> AsyncIterator[AsyncSupportsWrite]:
             async with aiofiles_open(path, self.MODE) as fd:

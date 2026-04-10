@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import hashlib
 import itertools
 import os
 import shutil
@@ -28,6 +29,46 @@ from .proxy import Proxy
 from .response import DownloadResponse
 from .slow_rate_protector import SlowRateProtectorFactory
 from .url import URL
+
+
+def read_sum(path: Path) -> dict[HashType, str]:
+    try:
+        sum_path = path.parent / f".{path.name}.sum"
+        if not sum_path.exists():
+            return {}
+
+        sums = {}
+        type_map = {ht.value.lower(): ht for ht in HashType}
+
+        with open(sum_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if ":" in line:
+                    k, v = line.strip().split(":", 1)
+                    k_lower = k.lower()
+                    if k_lower in type_map:
+                        sums[type_map[k_lower]] = v.lower()
+        return sums
+    except Exception:  # pylint: disable=W0718
+        pass
+    return {}
+
+
+def store_sum(path: Path, hash_type: HashType, hex_digest: str):
+    try:
+        sum_path = path.parent / f".{path.name}.sum"
+        sums = {}
+        if sum_path.exists():
+            with open(sum_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if ":" in line:
+                        k, v = line.strip().split(":", 1)
+                        sums[k.lower()] = v.lower()
+        sums[hash_type.value.lower()] = hex_digest.lower()
+        with open(sum_path, "w", encoding="utf-8") as f:
+            for k, v in sums.items():
+                f.write(f"{k}:{v}\n")
+    except Exception:  # pylint: disable=W0718
+        pass
 
 
 class HashMismatchException(Exception):
@@ -60,11 +101,20 @@ class DownloaderSettings:
     verify_ca_certificate: bool | str = True
     client_certificate: str | None = None
     client_private_key: str | None = None
+    check_local_hash: bool = False
+    description: str | None = None
 
 
 class Downloader(ABC):
     BUFFER_SIZE = 8 * 1024 * 1024
     RETRY_TIMEOUT = 5
+    HASH_READ_SIZE = 8 * 1024 * 1024
+    _HASH_CONSTRUCTORS = {
+        HashType.SHA512: hashlib.sha512,
+        HashType.SHA256: hashlib.sha256,
+        HashType.SHA1: hashlib.sha1,
+        HashType.MD5: hashlib.md5,
+    }
 
     def __init__(self, *, settings: DownloaderSettings):
         self._log = LoggerFactory.get_logger(
@@ -84,6 +134,13 @@ class Downloader(ABC):
         self._missing_sources: set[Path] = set()
         self._download_start = datetime.now()
 
+        self._initial_queue_files_count = 0
+        self._initial_queue_files_size = 0
+
+        # Set of algorithms that returned 404 for by-hash fetching.
+        # This is a session-level cache to minimize expensive network requests.
+        self._unsupported_by_hash_algos: set[HashType] = set()
+
         self.reset_stats()
 
         self.__post_init__()
@@ -96,6 +153,7 @@ class Downloader(ABC):
         self._downloaded_size = 0
         self._unmodified_count = 0
         self._unmodified_size = 0
+        self._hash_mismatch_count = 0
         self._missing_count = 0
         self._missing_size = 0
         self._error_count = 0
@@ -170,14 +228,23 @@ class Downloader(ABC):
             tasks.difference_update(done_tasks)
 
         self._download_start = datetime.now()
+        self._initial_queue_files_count = sum(
+            len(list(f.iter_variants())) for f in self._sources
+        )
+        self._initial_queue_files_size = sum(
+            sum(v.size for v in f.iter_variants()) for f in self._sources
+        )
+
         tasks: set[asyncio.Task[Any]] = set()
         progress_task = asyncio.create_task(self.progress_logger())
 
         while self._sources:
             source_file = self._sources.pop()
 
-            file_unmodified = False
+            all_variants_unmodified = False
             if source_file.check_size:
+                all_variants_unmodified = True
+                unmodified_variants = []
                 for variant in source_file.iter_variants():
                     target_path = (
                         self._settings.target_root_path / variant.get_source_path()
@@ -185,17 +252,20 @@ class Downloader(ABC):
 
                     try:
                         stat = target_path.stat()
-                        if stat.st_size == source_file.size:
-                            self._unmodified_count += 1
-                            self._unmodified_size += source_file.size
-                            self._unmodified.append(variant)
-
-                            file_unmodified = True
-                            break
+                        if stat.st_size == variant.size:
+                            unmodified_variants.append(variant)
+                        else:
+                            all_variants_unmodified = False
                     except FileNotFoundError:
-                        pass
+                        all_variants_unmodified = False
 
-            if file_unmodified:
+                if all_variants_unmodified:
+                    for variant in unmodified_variants:
+                        self._unmodified_count += 1
+                        self._unmodified_size += variant.size
+                        self._unmodified.append(variant)
+
+            if all_variants_unmodified:
                 continue
 
             tasks.add(asyncio.create_task(self.download_file(source_file)))
@@ -223,6 +293,67 @@ class Downloader(ABC):
 
         return True
 
+    async def _check_hash(
+        self, path: Path, variants: list[DownloadFileCompressionVariant]
+    ):
+        if not self._settings.check_local_hash:
+            return False
+
+        if not path.is_file():
+            return False
+
+        # No expected hash, assume the check failed to trigger a fresh fetch.
+        if not any(variant.hashes for variant in variants):
+            return False
+
+        path_resolved = path.resolve()
+
+        def _calc_and_verify():
+            cached_sums_lwr = read_sum(path_resolved)
+            for variant in variants:
+                for hash_type in (
+                    HashType.SHA256,
+                    HashType.SHA512,
+                    HashType.SHA1,
+                    HashType.MD5,
+                ):
+                    if hash_type not in variant.hashes:
+                        continue
+
+                    cached_sum_lwr = cached_sums_lwr.get(hash_type, "")
+                    if cached_sum_lwr == variant.hashes[hash_type].hash.lower():
+                        return True
+
+            for variant in variants:
+                # Prioritize fast hashes
+                for hash_type in (
+                    HashType.SHA256,
+                    HashType.SHA512,
+                    HashType.SHA1,
+                    HashType.MD5,
+                ):
+                    if hash_type not in variant.hashes:
+                        continue
+
+                    if hash_type not in self._HASH_CONSTRUCTORS:
+                        continue
+
+                    checksum = self._HASH_CONSTRUCTORS[hash_type]()
+                    with open(path_resolved, "rb") as fp:
+                        for chunk in iter(lambda: fp.read(self.HASH_READ_SIZE), b""):
+                            checksum.update(chunk)
+
+                    checksum_hex_lwr = checksum.hexdigest().lower()
+                    if checksum_hex_lwr == variant.hashes[hash_type].hash.lower():
+                        store_sum(path_resolved, hash_type, checksum_hex_lwr)
+                        return True
+            return False
+
+        result = await asyncio.to_thread(_calc_and_verify)
+        if not result:
+            self._hash_mismatch_count += 1
+        return result
+
     async def progress_logger(self):
         while True:
             try:
@@ -238,14 +369,35 @@ class Downloader(ABC):
             / (datetime.now().timestamp() - self._download_start.timestamp()),
             suffix="B/sec",
         )
+
+        total_processed_count = (
+            self._downloaded_count
+            + self._unmodified_count
+            + self._missing_count
+            + self._error_count
+        )
+        total_processed_size = (
+            self._downloaded_size
+            + self._unmodified_size
+            + self._missing_size
+            + self._error_size
+        )
+
+        description = (
+            f" [{self._settings.description}]" if self._settings.description else ""
+        )
         self._log.info(
-            message
-            + f": {self._downloaded_count} ({format_size(self._downloaded_size)},"
-            f" {download_rate});"
-            " unmodified:"
-            f" {self._unmodified_count} ({format_size(self._unmodified_size)});"
-            f" missing: {self._missing_count} ({format_size(self._missing_size)});"
-            f" errors: {self._error_count} ({format_size(self._error_size)})"
+            f"[{self._settings.url}]{description} "
+            + message
+            + f": {total_processed_count}/{self._initial_queue_files_count} "
+            f"({format_size(total_processed_size)}/"
+            f"{format_size(self._initial_queue_files_size)}) "
+            f"{download_rate}"
+            f" hash mismatch: ({self._hash_mismatch_count})"
+            f" unmodified: ({self._unmodified_count})"
+            f" ({format_size(self._unmodified_size)})"
+            f" missing: ({self._missing_count}) ({format_size(self._missing_size)})"
+            f" errors: ({self._error_count}) ({format_size(self._error_size)})"
         )
 
     async def download_file(self, source_file: DownloadFile):
@@ -266,10 +418,48 @@ class Downloader(ABC):
         for variant in source_file.iter_variants():
             expected_size = variant.size
 
-            for source_path in variant.get_all_paths():
+            # Check if any path for this variant is valid
+            valid_source_path = None
+            missing_paths = []
+
+            for path in variant.get_all_paths():
+                check_path = self._settings.target_root_path / path
+                if await self._check_hash(check_path, [variant]):
+                    if valid_source_path is None:
+                        valid_source_path = check_path
+                else:
+                    missing_paths.append(check_path)
+
+            if valid_source_path:
+                # We have at least one valid copy.
+                # Self-heal: If some paths are missing/invalid, restore them.
+                if missing_paths:
+                    self.link_or_copy(valid_source_path, *missing_paths)
+                    self._log.info(
+                        f"Self-healed {len(missing_paths)} missing paths from "
+                        f"{valid_source_path}"
+                    )
+
+                self._unmodified_count += 1
+                self._unmodified_size += variant.size
+                self._unmodified.append(variant)
+                continue
+
+            variant_success = False
+            source_paths = variant.get_prioritized_source_paths(
+                self._settings.check_hashes, self._unsupported_by_hash_algos
+            )
+
+            for source_path in source_paths:
                 target_path = self._settings.target_root_path / source_path
+                target_path.unlink(missing_ok=True)
 
                 tries = 10
+                # If we have more than one source path, we treat individual failures
+                # more gracefully and don't retry as aggressively for
+                # "skip-able" errors.
+                is_last_source_path = source_path == source_paths[-1]
+
                 while tries > 0:
                     async with (
                         self._settings.semaphore,
@@ -282,14 +472,41 @@ class Downloader(ABC):
                             continue
 
                         if response.missing:
+                            # Dynamic Algorithm Discovery:
+                            # If it's a by-hash path and it missing, blacklist this
+                            # algorithm for this repository session to avoid future
+                            # expensive 404s.
+                            if "by-hash" in source_path.parts:
+                                # Extract algorithm from path:
+                                # parent/by-hash/<alg>/<hash>
+                                try:
+                                    algo_index = source_path.parts.index("by-hash") + 1
+                                    algo_name = source_path.parts[algo_index]
+                                    for ht in HashType:
+                                        if ht.value == algo_name:
+                                            self._unsupported_by_hash_algos.add(ht)
+                                            self._log.debug(
+                                                f"By-hash algorithm {ht.value} "
+                                                "blacklisted (received 404)."
+                                            )
+                                            break
+                                except (ValueError, IndexError):
+                                    pass
+
                             if source_file.ignore_errors or source_file.ignore_missing:
                                 break
 
-                            await retry(
-                                f"File {source_path} is missing from server."
-                                " Retrying..."
-                            )
-                            continue
+                            if is_last_source_path:
+                                self._log.warning(
+                                    f"File {source_path} is missing from server."
+                                    " Not retrying."
+                                )
+                            else:
+                                self._log.debug(
+                                    f"File {source_path} is missing from server. "
+                                    "Trying next available path."
+                                )
+                            break
 
                         if response.error:
                             if source_file.ignore_errors:
@@ -338,7 +555,8 @@ class Downloader(ABC):
                                 variant.get_all_paths()
                             )
 
-                            return
+                            variant_success = True
+                            break
 
                         size = 0
                         target_path.unlink(missing_ok=True)
@@ -391,6 +609,22 @@ class Downloader(ABC):
                                             calculated_hash,
                                         )
 
+                            except HashMismatchException:
+                                if is_last_source_path:
+                                    await retry(
+                                        f"Hash mismatch occurred while downloading "
+                                        f"file {source_path}. Retrying..."
+                                    )
+                                    error = True
+                                    continue
+                                else:
+                                    self._log.debug(
+                                        f"Hash mismatch for {source_path}. "
+                                        "Trying next available path."
+                                    )
+                                    # Break to try next source_path
+                                    break
+
                             except Exception as ex:  # pylint: disable=W0718
                                 await retry(
                                     f"An error `{ex.__class__.__qualname__}: {ex}`"
@@ -401,12 +635,26 @@ class Downloader(ABC):
                                 continue
 
                         if expected_size > 0 and expected_size != size:
-                            await retry(
-                                f"Downloaded size {size} is differs from expected size"
-                                f" {expected_size} for file {source_path}. Retrying..."
-                            )
+                            if is_last_source_path:
+                                await retry(
+                                    f"Downloaded size {size} differs from expected "
+                                    f"size {expected_size} for file {source_path}. "
+                                    "Retrying..."
+                                )
+                            else:
+                                self._log.debug(
+                                    f"Size mismatch for {source_path}. "
+                                    "Trying next available path."
+                                )
+                                break
                             error = True
                             continue
+
+                        with open(target_path, "a") as f:
+                            os.fsync(f.fileno())
+
+                        for hash_type, hash_function in hashes.items():
+                            store_sum(target_path, hash_type, hash_function.hexdigest())
 
                         if response.date:
                             os.utime(
@@ -422,7 +670,18 @@ class Downloader(ABC):
 
                         self._downloaded.append(variant)
                         self._missing_sources.difference_update(variant.get_all_paths())
-                        return
+                        variant_success = True
+                        break
+
+                if variant_success:
+                    break
+
+        if any(
+            v in self._unmodified or v in self._downloaded
+            for v in source_file.compression_variants.values()
+            if len(v.get_all_paths()) > 0
+        ):
+            return
 
         if source_file.ignore_errors:
             self._log.info(f"Unable to download `{source_file.path}`: ignoring")
@@ -432,15 +691,18 @@ class Downloader(ABC):
             self._log.info(f"Optional file `{source_file.path}` is missing on server")
             return
 
+        missing_variants = [
+            v
+            for v in source_file.compression_variants.values()
+            if v not in self._unmodified and v not in self._downloaded
+        ]
         self._missing_sources.update(
-            itertools.chain.from_iterable(
-                v.get_all_paths() for v in source_file.compression_variants.values()
-            )
+            itertools.chain.from_iterable(v.get_all_paths() for v in missing_variants)
         )
 
         if not error:
             self._missing_count += 1
-            self._missing_size += source_file.size
+            self._missing_size += sum(v.size for v in missing_variants)
 
             self._log.warning(
                 f"Unable to download {source_file.path}: file is missing on server"
@@ -448,7 +710,7 @@ class Downloader(ABC):
             return
 
         self._error_count += 1
-        self._error_size += source_file.size
+        self._error_size += sum(v.size for v in missing_variants)
 
         self._log.error(f"Unable to download {source_file.path}: no more tries")
 

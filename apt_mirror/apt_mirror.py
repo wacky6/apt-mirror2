@@ -97,8 +97,16 @@ class PathCleaner:
         file_size = path.stat().st_size
         self._bytes_total += file_size
 
-        if path.relative_to(self._root_path) in self._keep_files:
+        relative_path = path.relative_to(self._root_path)
+        if relative_path in self._keep_files:
             return True
+
+        # Check if it's a .sum file for a kept file
+        if path.name.startswith(".") and path.name.endswith(".sum"):
+            owner_name = path.name[1:-4]
+            owner_path = relative_path.with_name(owner_name)
+            if owner_path in self._keep_files:
+                return True
 
         self._bytes_cleaned += file_size
         self._files_queue.append(path)
@@ -284,6 +292,8 @@ class RepositoryMirror:
                 verify_ca_certificate=self._config.verify_ca_certificate,
                 client_certificate=self._config.client_certificate,
                 client_private_key=self._config.client_private_key,
+                check_local_hash=self._config.check_local_hash,
+                description=str(self._repository),
             ),
         )
 
@@ -925,3 +935,7 @@ def main() -> int:
 
         LOG.exception(ex)
         return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
