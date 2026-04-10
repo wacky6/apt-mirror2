@@ -293,6 +293,7 @@ class RepositoryMirror:
                 client_certificate=self._config.client_certificate,
                 client_private_key=self._config.client_private_key,
                 check_local_hash=self._config.check_local_hash,
+                description=str(self._repository),
             ),
         )
 

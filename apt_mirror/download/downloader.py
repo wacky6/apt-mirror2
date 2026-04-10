@@ -102,6 +102,7 @@ class DownloaderSettings:
     client_certificate: str | None = None
     client_private_key: str | None = None
     check_local_hash: bool = False
+    description: str | None = None
 
 
 class Downloader(ABC):
@@ -132,6 +133,9 @@ class Downloader(ABC):
         # Either missing on server files or files with errors
         self._missing_sources: set[Path] = set()
         self._download_start = datetime.now()
+
+        self._initial_queue_files_count = 0
+        self._initial_queue_files_size = 0
 
         # Set of algorithms that returned 404 for by-hash fetching.
         # This is a session-level cache to minimize expensive network requests.
@@ -224,6 +228,13 @@ class Downloader(ABC):
             tasks.difference_update(done_tasks)
 
         self._download_start = datetime.now()
+        self._initial_queue_files_count = sum(
+            len(list(f.iter_variants())) for f in self._sources
+        )
+        self._initial_queue_files_size = sum(
+            sum(v.size for v in f.iter_variants()) for f in self._sources
+        )
+
         tasks: set[asyncio.Task[Any]] = set()
         progress_task = asyncio.create_task(self.progress_logger())
 
@@ -358,9 +369,29 @@ class Downloader(ABC):
             / (datetime.now().timestamp() - self._download_start.timestamp()),
             suffix="B/sec",
         )
+
+        total_processed_count = (
+            self._downloaded_count
+            + self._unmodified_count
+            + self._missing_count
+            + self._error_count
+        )
+        total_processed_size = (
+            self._downloaded_size
+            + self._unmodified_size
+            + self._missing_size
+            + self._error_size
+        )
+
+        description = (
+            f" [{self._settings.description}]" if self._settings.description else ""
+        )
         self._log.info(
-            message
-            + f": {self._downloaded_count} ({format_size(self._downloaded_size)}) "
+            f"[{self._settings.url}]{description} "
+            + message
+            + f": {total_processed_count}/{self._initial_queue_files_count} "
+            f"({format_size(total_processed_size)}/"
+            f"{format_size(self._initial_queue_files_size)}) "
             f"{download_rate}"
             f" hash mismatch: ({self._hash_mismatch_count})"
             f" unmodified: ({self._unmodified_count})"
