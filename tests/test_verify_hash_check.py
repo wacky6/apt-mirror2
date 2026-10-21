@@ -284,3 +284,75 @@ class TestVerifyHashCheck(BaseTest):
         self.assertEqual(len(opened_paths), 4)  # 3 compressed + 1 uncompressed
         self.assertEqual(downloader._downloaded_count, 4)
         self.assertEqual(downloader._downloaded_size, 28)
+        await downloader.aclose()
+
+    def test_check_hash_fast_size_fail_and_single_read(self):
+        asyncio.run(self._test_check_hash_fast_size_fail_and_single_read_logic())
+
+    async def _test_check_hash_fast_size_fail_and_single_read_logic(self):
+        file_path = self.tmp_dir / "multi_hash.deb"
+        content = b"actual-file-bytes"
+        file_path.write_bytes(content)
+
+        settings = MagicMock(spec=DownloaderSettings)
+        settings.url = "http://example.com"
+        settings.semaphore = asyncio.Semaphore(1)
+        settings.check_hashes = set(HashType)
+        settings.check_local_hash = True
+
+        class TestDownloader(Downloader):
+            def __post_init__(self):
+                self._log = MagicMock()
+
+            def stream(self, source_path):
+                return MagicMock()
+
+        downloader = TestDownloader(settings=settings)
+        try:
+            # 1. Size mismatch -> should fail fast without opening the file for hashing
+            dl_wrong_size = DownloadFile.from_path(Path("multi_hash.deb"))
+            dl_wrong_size.add_compression_variant(
+                Path("multi_hash.deb"),
+                size=len(content) + 100,
+                hash_sum=HashSum(HashType.SHA256, "a" * 64),
+            )
+            with patch("apt_mirror.download.downloader.open") as mock_open:
+                mock_open.side_effect = OSError("no .sum file")
+                res = await downloader._check_hash(
+                    file_path, list(dl_wrong_size.iter_variants())
+                )
+            self.assertFalse(res)
+            self.assertEqual(downloader._hash_mismatch_count, 1)
+
+            # 2. Same size, 4 wrong hashes -> should only read the file once (SHA256)
+            dl_multi = DownloadFile.from_path(Path("multi_hash.deb"))
+            for ht, digest_len in (
+                (HashType.SHA512, 128),
+                (HashType.SHA256, 64),
+                (HashType.SHA1, 40),
+                (HashType.MD5, 32),
+            ):
+                dl_multi.add_compression_variant(
+                    Path("multi_hash.deb"),
+                    size=len(content),
+                    hash_sum=HashSum(ht, "0" * digest_len),
+                )
+
+            real_open = open
+            binary_opens = 0
+
+            def counting_open(path, mode="r", *args, **kwargs):
+                nonlocal binary_opens
+                if "b" in mode:
+                    binary_opens += 1
+                return real_open(path, mode, *args, **kwargs)
+
+            with patch("apt_mirror.download.downloader.open", counting_open):
+                res2 = await downloader._check_hash(
+                    file_path, list(dl_multi.iter_variants())
+                )
+
+            self.assertFalse(res2)
+            self.assertEqual(binary_opens, 1)
+        finally:
+            await downloader.aclose()

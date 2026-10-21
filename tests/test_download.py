@@ -757,6 +757,54 @@ class TestDownloader(IsolatedAsyncioTestCase):
 
             self.assertTrue(downloader.has_errors())
             self.assertEqual(downloader.error_files_count, 1)
+            await downloader.aclose()
+
+    async def test_slow_rate_protector_excludes_file_write_time(self):
+        with TemporaryDirectory() as tmpdir:
+            current_time = datetime(2024, 1, 1, 0, 0, 0)
+
+            class SlowWriteFactory(self._AIOFileWriterFactory):
+                class _SlowWriter(self._AIOFileWriterFactory._AIOFileWriter):
+                    async def write(self, data: bytes) -> int:
+                        nonlocal current_time
+                        # Simulate a 20-second local disk write stall per chunk
+                        from datetime import timedelta
+
+                        current_time += timedelta(seconds=20)
+                        return await super().write(data)
+
+                @asynccontextmanager
+                async def open(self, path: Path):
+                    writer = self._SlowWriter(path)
+                    try:
+                        yield writer
+                    finally:
+                        writer.close()
+
+            settings = self._make_settings(tmpdir)
+            settings.aiofile_factory = SlowWriteFactory()
+            settings.slow_rate_protector_factory = SlowRateProtectorFactory(
+                True, rate_startup=15, slow_rate=100 * 1024
+            )
+
+            downloader = self._Downloader(settings=settings)
+            downloader.set_response(b"a" * 1024, b"b" * 1024)
+
+            with (
+                patch(
+                    "apt_mirror.download.slow_rate_protector.datetime"
+                ) as mock_srp_dt,
+                patch("apt_mirror.download.downloader.datetime") as mock_dl_dt,
+            ):
+                mock_srp_dt.now.side_effect = lambda: current_time
+                mock_dl_dt.now.side_effect = lambda: current_time
+
+                source_file = DownloadFile.from_path(Path("pool/main/p/pkg.deb"))
+                await downloader.download_file(source_file)
+
+            self.assertFalse(downloader.has_errors())
+            self.assertEqual(downloader.downloaded_files_count, 1)
+            await downloader.aclose()
 
     @staticmethod
     async def _async_iter(chunks: list[bytes]):
