@@ -76,7 +76,8 @@ try:
             self,
             path: Path,
         ):
-            yield await aiofile_open(path, mode=self.MODE, context=self._context)
+            async with aiofile_open(path, mode=self.MODE, context=self._context) as fp:
+                yield fp
 
         async def test_storage(self, *test_paths: Path) -> None:
             for path in test_paths:

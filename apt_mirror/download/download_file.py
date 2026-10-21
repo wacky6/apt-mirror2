@@ -2,7 +2,7 @@
 
 import hashlib
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Protocol, overload
@@ -162,6 +162,7 @@ class DownloadFile:
     check_utime: bool = False
     ignore_errors: bool = False
     ignore_missing: bool = False
+    init_default_variant: InitVar[bool] = True
 
     @staticmethod
     def uncompressed_path(path: Path):
@@ -184,7 +185,10 @@ class DownloadFile:
         hash_sum: HashSum,
         use_by_hash: bool,
     ):
-        download_file = DownloadFile.from_path(cls.uncompressed_path(path))
+        download_file = cls(
+            path=cls.uncompressed_path(path),
+            init_default_variant=False,
+        )
         download_file.add_compression_variant(
             path=path,
             size=size,
@@ -194,8 +198,8 @@ class DownloadFile:
 
         return download_file
 
-    def __post_init__(self):
-        if not self.compression_variants:
+    def __post_init__(self, init_default_variant: bool = True):
+        if init_default_variant and not self.compression_variants:
             self.add_compression_variant(self.path, size=0)
 
     def add_compression_variant(
