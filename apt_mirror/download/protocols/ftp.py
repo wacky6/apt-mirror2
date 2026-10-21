@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -28,7 +29,7 @@ class FTPDownloader(Downloader):
         async def func() -> AsyncIterator[bytes]:
             async with ftp.download_stream(path) as stream:  # type: ignore
                 async for data in stream.iter_by_block(  # type: ignore
-                    count=self.BUFFER_SIZE
+                    count=self.STREAM_CHUNK_SIZE
                 ):
                     yield data
 
@@ -36,48 +37,59 @@ class FTPDownloader(Downloader):
 
     @asynccontextmanager
     async def stream(self, source_path: Path):
+        stack = contextlib.AsyncExitStack()
+        ftp: aioftp.Client | None = None
+        response: DownloadResponse
         try:
-            async with aioftp.Client.context(  # type: ignore
-                self._settings.url.hostname,
-                port=self._settings.url.port or aioftp.DEFAULT_PORT,
-                user=self._settings.url.username or aioftp.DEFAULT_USER,
-                password=self._settings.url.password or aioftp.DEFAULT_PASSWORD,
-                parse_list_line_custom_first=True,
-                socket_timeout=30,
-            ) as ftp:
-                ftp.parse_list_line_custom = self.parse_list_line_unix_links(ftp)
+            ftp = await stack.enter_async_context(
+                aioftp.Client.context(  # type: ignore
+                    self._settings.url.hostname,
+                    port=self._settings.url.port or aioftp.DEFAULT_PORT,
+                    user=self._settings.url.username or aioftp.DEFAULT_USER,
+                    password=self._settings.url.password or aioftp.DEFAULT_PASSWORD,
+                    parse_list_line_custom_first=True,
+                    socket_timeout=30,
+                )
+            )
+            ftp.parse_list_line_custom = self.parse_list_line_unix_links(ftp)
 
-                await ftp.change_directory(self._settings.url.path)
+            await ftp.change_directory(self._settings.url.path)
 
-                try:
-                    stat = await self._get_stat(ftp, source_path)
-                except FTPFileMissingException:
-                    yield DownloadResponse(_stream=None, missing=True)
-                    return
-                except StatusCodeError as ex:
-                    yield DownloadResponse(_stream=None, error=str(ex))
-                    return
-
-                yield DownloadResponse(
+            try:
+                stat = await self._get_stat(ftp, source_path)
+                response = DownloadResponse(
                     missing=False,
                     error=None,
                     date=stat.date,
                     size=stat.size,
                     _stream=self.iter_by_block(ftp, source_path),  # type: ignore
                 )
+            except FTPFileMissingException:
+                response = DownloadResponse(_stream=None, missing=True)
+            except StatusCodeError as ex:
+                response = DownloadResponse(_stream=None, error=str(ex))
         except OSError as ex:
             # https://github.com/aio-libs/aioftp/issues/173
             connection_refused = ex.errno == 111 or "111" in str(ex)
-            yield DownloadResponse(
+            response = DownloadResponse(
                 _stream=None,
                 retry=connection_refused,
                 error=(str(ex) if not connection_refused else None),
             )
         except Exception as ex:  # pylint: disable=W0718
-            yield DownloadResponse(
+            response = DownloadResponse(
                 _stream=None,
                 error=f"{ex.__class__.__qualname__}: {str(ex)}",
             )
+
+        try:
+            yield response
+        finally:
+            with contextlib.suppress(Exception):
+                await stack.aclose()
+            if ftp is not None:
+                with contextlib.suppress(Exception):
+                    ftp.close()
 
     def parse_list_line_unix_links(self, client: aioftp.Client):
         def do_parse_list_line(b: bytes) -> tuple[PurePosixPath, dict[str, str]]:

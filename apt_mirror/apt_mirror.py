@@ -97,8 +97,16 @@ class PathCleaner:
         file_size = path.stat().st_size
         self._bytes_total += file_size
 
-        if path.relative_to(self._root_path) in self._keep_files:
+        relative_path = path.relative_to(self._root_path)
+        if relative_path in self._keep_files:
             return True
+
+        # Check if it's a .sum file for a kept file
+        if path.name.startswith(".") and path.name.endswith(".sum"):
+            owner_name = path.name[1:-4]
+            owner_path = relative_path.with_name(owner_name)
+            if owner_path in self._keep_files:
+                return True
 
         self._bytes_cleaned += file_size
         self._files_queue.append(path)
@@ -284,6 +292,8 @@ class RepositoryMirror:
                 verify_ca_certificate=self._config.verify_ca_certificate,
                 client_certificate=self._config.client_certificate,
                 client_private_key=self._config.client_private_key,
+                check_local_hash=self._config.check_local_hash,
+                description=str(self._repository),
             ),
         )
 
@@ -296,78 +306,81 @@ class RepositoryMirror:
             bool: True if mirror was successful, False otherwise
         """
         async with self._semaphore:
-            self._log.info(f"Mirroring repository {self._repository}")
+            try:
+                self._log.info(f"Mirroring repository {self._repository}")
 
-            recheck_release_files = False
-            downloaded_metadata_files = []
-            while True:
-                release_files = await self.download_release_files()
-                if not release_files:
-                    self._log.error(
-                        "Unable to obtain release files "
-                        f"for repository {self._repository}"
-                    )
-                    return False
-
-                if recheck_release_files:
-                    if not self._downloader.downloaded_files_count:
-                        self._log.info("No new release files were downloaded")
-                        break
-                    else:
-                        self._log.info("Release files were changed")
-                        self._error = False
-
-                    recheck_release_files = False
-
-                # Download other metadata files
-                metadata_files = await self.download_metadata_files()
-                if not metadata_files:
-                    self._log.error(
-                        "Unable to obtain metadata files "
-                        f"for repository {self._repository}"
-                    )
-                    return False
-
-                downloaded_metadata_files = self._downloader.get_all_files()
-
-                await self.clean_repository_skel(
-                    set(
-                        itertools.chain.from_iterable(
-                            v.get_all_paths() for v in downloaded_metadata_files
+                recheck_release_files = False
+                downloaded_metadata_files = []
+                while True:
+                    release_files = await self.download_release_files()
+                    if not release_files:
+                        self._log.error(
+                            "Unable to obtain release files "
+                            f"for repository {self._repository}"
                         )
+                        return False
+
+                    if recheck_release_files:
+                        if not self._downloader.downloaded_files_count:
+                            self._log.info("No new release files were downloaded")
+                            break
+                        else:
+                            self._log.info("Release files were changed")
+                            self._error = False
+
+                        recheck_release_files = False
+
+                    # Download other metadata files
+                    metadata_files = await self.download_metadata_files()
+                    if not metadata_files:
+                        self._log.error(
+                            "Unable to obtain metadata files "
+                            f"for repository {self._repository}"
+                        )
+                        return False
+
+                    downloaded_metadata_files = self._downloader.get_all_files()
+
+                    await self.clean_repository_skel(
+                        set(
+                            itertools.chain.from_iterable(
+                                v.get_all_paths() for v in downloaded_metadata_files
+                            )
+                        )
+                        - self._downloader.get_missing_sources(),
                     )
-                    - self._downloader.get_missing_sources(),
-                )
 
-                # Download remaining pool
-                await self.download_pool_files()
+                    # Download remaining pool
+                    await self.download_pool_files()
 
+                    if not self._error:
+                        break
+
+                    recheck_release_files = True
+                    self._log.warning("Trying to recheck release files...")
+
+                # Move skel to mirror
                 if not self._error:
-                    break
-
-                recheck_release_files = True
-                self._log.warning("Trying to recheck release files...")
-
-            # Move skel to mirror
-            if not self._error:
-                await self.move_metadata(downloaded_metadata_files)
-            else:
-                self._log.warning(
-                    "Metadata movement skipped because of download errors"
-                )
-
-            if self._repository.clean:
-                if not self._error:
-                    await self.clean_repository(
-                        needed_files=self._downloader.get_downloaded_files_paths(),
-                        unlink=self._config.autoclean,
-                    )
+                    await self.move_metadata(downloaded_metadata_files)
                 else:
                     self._log.warning(
-                        "Repository cleanup skipped because of download errors"
+                        "Metadata movement skipped because of download errors"
                     )
 
-            self._log.info(f"Repository {self._repository} mirroring complete")
+                if self._repository.clean:
+                    if not self._error:
+                        await self.clean_repository(
+                            needed_files=self._downloader.get_downloaded_files_paths(),
+                            unlink=self._config.autoclean,
+                        )
+                    else:
+                        self._log.warning(
+                            "Repository cleanup skipped because of download errors"
+                        )
+
+                self._log.info(f"Repository {self._repository} mirroring complete")
+            finally:
+                await self._downloader.aclose()
 
         return not self._error
 
@@ -925,3 +938,7 @@ def main() -> int:
 
         LOG.exception(ex)
         return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

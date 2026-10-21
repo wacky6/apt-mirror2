@@ -2,20 +2,22 @@
 
 import asyncio
 import contextlib
+import hashlib
 import itertools
 import os
 import shutil
+import stat as stat_module
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from aiolimiter import AsyncLimiter
 
-from ..aiofile import BaseAsyncIOFileWriterFactory
+from ..aiofile import AsyncIOFileFactory, BaseAsyncIOFileWriterFactory
 from ..logs import LoggerFactory
 from .download_file import (
     DownloadFile,
@@ -28,6 +30,69 @@ from .proxy import Proxy
 from .response import DownloadResponse
 from .slow_rate_protector import SlowRateProtectorFactory
 from .url import URL
+
+_HASH_TYPE_BY_LOWER = {ht.value.lower(): ht for ht in HashType}
+
+
+def read_sum(path: Path) -> dict[HashType, str]:
+    try:
+        sum_path = path.parent / f".{path.name}.sum"
+        sums: dict[HashType, str] = {}
+
+        with open(sum_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if ":" in line:
+                    k, v = line.strip().split(":", 1)
+                    ht = _HASH_TYPE_BY_LOWER.get(k.lower())
+                    if ht is not None:
+                        sums[ht] = v.lower()
+        return sums
+    except OSError:
+        return {}
+    except Exception:  # pylint: disable=W0718
+        return {}
+
+
+def store_sums(
+    path: Path,
+    new_sums: dict[HashType, str],
+    existing_sums: dict[HashType, str] | None = None,
+) -> None:
+    if not new_sums:
+        return
+
+    try:
+        sum_path = path.parent / f".{path.name}.sum"
+        sums: dict[str, str] = {}
+        if existing_sums is not None:
+            for ht, digest in existing_sums.items():
+                sums[ht.value.lower()] = digest.lower()
+        else:
+            with (
+                contextlib.suppress(OSError),
+                open(sum_path, "r", encoding="utf-8") as f,
+            ):
+                for line in f:
+                    if ":" in line:
+                        k, v = line.strip().split(":", 1)
+                        sums[k.lower()] = v.lower()
+
+        for ht, digest in new_sums.items():
+            sums[ht.value.lower()] = digest.lower()
+
+        with open(sum_path, "w", encoding="utf-8") as f:
+            f.writelines(f"{k}:{v}\n" for k, v in sums.items())
+    except Exception:  # pylint: disable=W0718
+        pass
+
+
+def store_sum(
+    path: Path,
+    hash_type: HashType,
+    hex_digest: str,
+    existing_sums: dict[HashType, str] | None = None,
+):
+    store_sums(path, {hash_type: hex_digest}, existing_sums=existing_sums)
 
 
 class HashMismatchException(Exception):
@@ -60,11 +125,24 @@ class DownloaderSettings:
     verify_ca_certificate: bool | str = True
     client_certificate: str | None = None
     client_private_key: str | None = None
+    check_local_hash: bool = False
+    description: str | None = None
 
 
 class Downloader(ABC):
     BUFFER_SIZE = 8 * 1024 * 1024
+    STREAM_CHUNK_SIZE = 128 * 1024
     RETRY_TIMEOUT = 5
+    MAX_FREE_RETRIES = 5
+    MAX_CONCURRENT_TASKS = 128
+    HASH_WORKERS = max(32, (os.cpu_count() or 1) * 4)
+    HASH_READ_SIZE = 8 * 1024 * 1024
+    _HASH_CONSTRUCTORS = {
+        HashType.SHA512: hashlib.sha512,
+        HashType.SHA256: hashlib.sha256,
+        HashType.SHA1: hashlib.sha1,
+        HashType.MD5: hashlib.md5,
+    }
 
     def __init__(self, *, settings: DownloaderSettings):
         self._log = LoggerFactory.get_logger(
@@ -73,6 +151,7 @@ class Downloader(ABC):
         )
 
         self._settings = settings
+        self._hash_executor: ThreadPoolExecutor | None = None
 
         # Download queue. Reseted in download()
         self._sources: list[DownloadFile] = []
@@ -84,6 +163,14 @@ class Downloader(ABC):
         self._missing_sources: set[Path] = set()
         self._download_start = datetime.now()
 
+        self._initial_queue_files_count = 0
+        self._initial_queue_files_size = 0
+
+        # Set of algorithms that returned 404 for by-hash fetching.
+        # This is a session-level cache to minimize expensive network requests.
+        self._unsupported_by_hash_algos: set[HashType] = set()
+        self._supported_by_hash_algos: set[HashType] = set()
+
         self.reset_stats()
 
         self.__post_init__()
@@ -91,11 +178,25 @@ class Downloader(ABC):
     def __post_init__(self):  # noqa: B027
         pass
 
+    def _get_hash_executor(self) -> ThreadPoolExecutor:
+        if self._hash_executor is None:
+            self._hash_executor = ThreadPoolExecutor(
+                max_workers=self.HASH_WORKERS,
+                thread_name_prefix="apt-mirror-hash",
+            )
+        return self._hash_executor
+
+    async def aclose(self):
+        if self._hash_executor is not None:
+            self._hash_executor.shutdown(wait=False, cancel_futures=True)
+            self._hash_executor = None
+
     def reset_stats(self):
         self._downloaded_count = 0
         self._downloaded_size = 0
         self._unmodified_count = 0
         self._unmodified_size = 0
+        self._hash_mismatch_count = 0
         self._missing_count = 0
         self._missing_size = 0
         self._error_count = 0
@@ -162,49 +263,62 @@ class Downloader(ABC):
         return self._unmodified_size
 
     async def download(self):
-        async def remove_finished_tasks(tasks: set[asyncio.Task[Any]]):
-            done_tasks, _ = await asyncio.wait(
-                tasks, return_when=asyncio.FIRST_COMPLETED
-            )
-
-            tasks.difference_update(done_tasks)
-
         self._download_start = datetime.now()
-        tasks: set[asyncio.Task[Any]] = set()
+        self._initial_queue_files_count = sum(
+            len(list(f.iter_variants())) for f in self._sources
+        )
+        self._initial_queue_files_size = sum(
+            sum(v.size for v in f.iter_variants()) for f in self._sources
+        )
+
         progress_task = asyncio.create_task(self.progress_logger())
 
-        while self._sources:
-            source_file = self._sources.pop()
+        async def worker():
+            while self._sources:
+                source_file = self._sources.pop()
 
-            file_unmodified = False
-            if source_file.check_size:
-                for variant in source_file.iter_variants():
-                    target_path = (
-                        self._settings.target_root_path / variant.get_source_path()
-                    )
+                all_variants_unmodified = False
+                if source_file.check_size:
+                    all_variants_unmodified = True
+                    unmodified_variants = []
+                    for variant in source_file.iter_variants():
+                        target_path = (
+                            self._settings.target_root_path / variant.get_source_path()
+                        )
 
-                    try:
-                        stat = target_path.stat()
-                        if stat.st_size == source_file.size:
+                        try:
+                            stat = target_path.stat()
+                            if stat.st_size == variant.size:
+                                unmodified_variants.append(variant)
+                            else:
+                                all_variants_unmodified = False
+                        except FileNotFoundError:
+                            all_variants_unmodified = False
+
+                    if all_variants_unmodified:
+                        for variant in unmodified_variants:
                             self._unmodified_count += 1
-                            self._unmodified_size += source_file.size
+                            self._unmodified_size += variant.size
                             self._unmodified.append(variant)
 
-                            file_unmodified = True
-                            break
-                    except FileNotFoundError:
-                        pass
+                if all_variants_unmodified:
+                    continue
 
-            if file_unmodified:
-                continue
+                try:
+                    await self.download_file(source_file)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # pylint: disable=W0718
+                    self._error_count += 1
+                    self._log.error(
+                        f"Unhandled exception in download task: "
+                        f"{exc.__class__.__qualname__}: {exc}"
+                    )
 
-            tasks.add(asyncio.create_task(self.download_file(source_file)))
-
-            if len(tasks) >= 128:
-                await remove_finished_tasks(tasks)
-
-        while tasks:
-            await remove_finished_tasks(tasks)
+        worker_count = min(len(self._sources), self.MAX_CONCURRENT_TASKS)
+        if worker_count > 0:
+            workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+            await asyncio.gather(*workers)
 
         progress_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -214,6 +328,8 @@ class Downloader(ABC):
 
     def need_update(self, path: Path, size: int | None, date: datetime | None) -> bool:
         if path.exists() and date and size:
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
             stat = path.stat()
             target_date = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
             target_size = stat.st_size
@@ -222,6 +338,98 @@ class Downloader(ABC):
                 return False
 
         return True
+
+    async def _check_hash(
+        self, path: Path, variants: list[DownloadFileCompressionVariant]
+    ):
+        if not self._settings.check_local_hash:
+            return False
+
+        # No expected hash, assume the check failed to trigger a fresh fetch.
+        if not any(variant.hashes for variant in variants):
+            return False
+
+        def _calc_and_verify() -> bool | None:
+            try:
+                st = path.stat()
+            except OSError:
+                return None
+
+            if not stat_module.S_ISREG(st.st_mode):
+                return None
+
+            path_resolved = path.resolve() if path.is_symlink() else path
+            cached_sums_lwr = read_sum(path_resolved)
+            if cached_sums_lwr:
+                for variant in variants:
+                    if variant.size > 0 and st.st_size != variant.size:
+                        continue
+                    for hash_type in (
+                        HashType.SHA256,
+                        HashType.SHA512,
+                        HashType.SHA1,
+                        HashType.MD5,
+                    ):
+                        if hash_type not in variant.hashes:
+                            continue
+
+                        cached_sum_lwr = cached_sums_lwr.get(hash_type, "")
+                        if cached_sum_lwr == variant.hashes[hash_type].hash.lower():
+                            return True
+
+            buf_size = (
+                min(self.HASH_READ_SIZE, max(st.st_size, 4096))
+                if st.st_size > 0
+                else self.HASH_READ_SIZE
+            )
+            computed_hashes: dict[HashType, str] = {}
+
+            for variant in variants:
+                if variant.size > 0 and st.st_size != variant.size:
+                    continue
+
+                # Prioritize fast hashes; only verify the best available hash
+                # per variant since any mismatch means the file does not match.
+                for hash_type in (
+                    HashType.SHA256,
+                    HashType.SHA512,
+                    HashType.SHA1,
+                    HashType.MD5,
+                ):
+                    if hash_type not in variant.hashes:
+                        continue
+
+                    if hash_type not in self._HASH_CONSTRUCTORS:
+                        continue
+
+                    checksum_hex_lwr = computed_hashes.get(hash_type)
+                    if checksum_hex_lwr is None:
+                        checksum = self._HASH_CONSTRUCTORS[hash_type]()
+                        with open(path_resolved, "rb") as fp:
+                            for chunk in iter(lambda: fp.read(buf_size), b""):
+                                checksum.update(chunk)
+
+                        checksum_hex_lwr = checksum.hexdigest().lower()
+                        computed_hashes[hash_type] = checksum_hex_lwr
+
+                    if checksum_hex_lwr == variant.hashes[hash_type].hash.lower():
+                        store_sum(
+                            path_resolved,
+                            hash_type,
+                            checksum_hex_lwr,
+                            existing_sums=cached_sums_lwr,
+                        )
+                        return True
+                    break
+            return False
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(self._get_hash_executor(), _calc_and_verify)
+        if result is None:
+            return False
+        if not result:
+            self._hash_mismatch_count += 1
+        return result
 
     async def progress_logger(self):
         while True:
@@ -233,20 +441,57 @@ class Downloader(ABC):
             self.log_status("Download progress")
 
     def log_status(self, message: str):
+        elapsed = datetime.now().timestamp() - self._download_start.timestamp()
         download_rate = format_size(
-            self._downloaded_size
-            / (datetime.now().timestamp() - self._download_start.timestamp()),
+            self._downloaded_size / elapsed if elapsed > 0 else 0,
             suffix="B/sec",
         )
-        self._log.info(
-            message
-            + f": {self._downloaded_count} ({format_size(self._downloaded_size)},"
-            f" {download_rate});"
-            " unmodified:"
-            f" {self._unmodified_count} ({format_size(self._unmodified_size)});"
-            f" missing: {self._missing_count} ({format_size(self._missing_size)});"
-            f" errors: {self._error_count} ({format_size(self._error_size)})"
+
+        total_processed_count = (
+            self._downloaded_count
+            + self._unmodified_count
+            + self._missing_count
+            + self._error_count
         )
+        total_processed_size = (
+            self._downloaded_size
+            + self._unmodified_size
+            + self._missing_size
+            + self._error_size
+        )
+
+        description = (
+            f" [{self._settings.description}]" if self._settings.description else ""
+        )
+        self._log.info(
+            f"[{self._settings.url}]{description} "
+            + message
+            + f": {total_processed_count}/{self._initial_queue_files_count} "
+            f"({format_size(total_processed_size)}/"
+            f"{format_size(self._initial_queue_files_size)}) "
+            f"{download_rate}"
+            f" hash mismatch: ({self._hash_mismatch_count})"
+            f" unmodified: ({self._unmodified_count})"
+            f" ({format_size(self._unmodified_size)})"
+            f" missing: ({self._missing_count}) ({format_size(self._missing_size)})"
+            f" errors: ({self._error_count}) ({format_size(self._error_size)})"
+        )
+
+    @staticmethod
+    def _get_by_hash_algorithm(source_path: Path) -> HashType | None:
+        if "by-hash" not in source_path.parts:
+            return None
+
+        try:
+            algo_index = source_path.parts.index("by-hash") + 1
+            algo_name = source_path.parts[algo_index]
+            for ht in HashType:
+                if ht.value == algo_name:
+                    return ht
+        except (ValueError, IndexError):
+            pass
+
+        return None
 
     async def download_file(self, source_file: DownloadFile):
         async def retry(
@@ -263,14 +508,65 @@ class Downloader(ABC):
                 await asyncio.sleep(self.RETRY_TIMEOUT)
 
         error = False
+        completed_variants: list[DownloadFileCompressionVariant] = []
         for variant in source_file.iter_variants():
             expected_size = variant.size
 
-            for source_path in variant.get_all_paths():
+            # Check if any path for this variant is valid
+            valid_source_path = None
+            missing_paths = []
+
+            for path in variant.get_all_paths():
+                check_path = self._settings.target_root_path / path
+                if await self._check_hash(check_path, [variant]):
+                    if valid_source_path is None:
+                        valid_source_path = check_path
+                else:
+                    missing_paths.append(check_path)
+
+            if valid_source_path:
+                # We have at least one valid copy.
+                # Self-heal: If some paths are missing/invalid, restore them.
+                if missing_paths:
+                    await asyncio.get_running_loop().run_in_executor(
+                        self._get_hash_executor(),
+                        self.link_or_copy,
+                        valid_source_path,
+                        *missing_paths,
+                    )
+                    self._log.info(
+                        f"Self-healed {len(missing_paths)} missing paths from "
+                        f"{valid_source_path}"
+                    )
+
+                self._unmodified_count += 1
+                self._unmodified_size += variant.size
+                self._unmodified.append(variant)
+                completed_variants.append(variant)
+                continue
+
+            variant_success = False
+            failed_by_hash_algos: set[HashType] = set()
+            succeeded_by_hash_algo: HashType | None = None
+            source_paths = variant.get_prioritized_source_paths(
+                self._settings.check_hashes, self._unsupported_by_hash_algos
+            )
+
+            for source_path in source_paths:
                 target_path = self._settings.target_root_path / source_path
 
                 tries = 10
+                free_retries = self.MAX_FREE_RETRIES
+                # If we have more than one source path, we treat individual failures
+                # more gracefully and don't retry as aggressively for
+                # "skip-able" errors.
+                is_last_source_path = source_path == source_paths[-1]
+
                 while tries > 0:
+                    retry_message: str | None = None
+                    should_retry = False
+                    skip_try = False
+
                     async with (
                         self._settings.semaphore,
                         self.stream(source_path) as response,
@@ -278,31 +574,48 @@ class Downloader(ABC):
                         target_path.parent.mkdir(parents=True, exist_ok=True)
 
                         if response.retry:
-                            await retry(skip_try=True)
-                            continue
+                            if free_retries > 0:
+                                free_retries -= 1
+                                should_retry = True
+                                skip_try = True
+                            else:
+                                should_retry = True
+                                retry_message = (
+                                    "Connection closed by server while downloading"
+                                    f" {source_path}. Retrying..."
+                                )
+                                error = True
+                        elif response.missing:
+                            by_hash_algo = self._get_by_hash_algorithm(source_path)
+                            if by_hash_algo is not None:
+                                failed_by_hash_algos.add(by_hash_algo)
 
-                        if response.missing:
-                            if source_file.ignore_errors or source_file.ignore_missing:
-                                break
-
-                            await retry(
-                                f"File {source_path} is missing from server."
-                                " Retrying..."
-                            )
-                            continue
-
-                        if response.error:
+                            if (
+                                not source_file.ignore_errors
+                                and not source_file.ignore_missing
+                            ):
+                                if is_last_source_path:
+                                    self._log.warning(
+                                        f"File {source_path} is missing from server."
+                                        " Not retrying."
+                                    )
+                                else:
+                                    self._log.debug(
+                                        f"File {source_path} is missing from server. "
+                                        "Trying next available path."
+                                    )
+                            break
+                        elif response.error:
                             if source_file.ignore_errors:
                                 break
 
-                            await retry(
+                            should_retry = True
+                            retry_message = (
                                 f"Received error `{response.error}` while downloading"
                                 f" {source_path}. Retrying..."
                             )
                             error = True
-                            continue
-
-                        if (
+                        elif (
                             expected_size > 0
                             and response.size
                             and response.size > 0
@@ -311,118 +624,255 @@ class Downloader(ABC):
                             if source_file.ignore_errors:
                                 break
 
-                            await retry(
-                                f"Server reported size {response.size} differs from"
-                                f" expected size {expected_size} for file"
-                                f" {source_path}. Retrying..."
-                            )
                             error = True
-                            continue
-
-                        mirror_paths = [
-                            self._settings.target_root_path / path
-                            for path in variant.get_all_paths()
-                        ]
-
-                        if response.size and not self.need_update(
-                            target_path, response.size, response.date
-                        ):
-                            self._unmodified_count += 1
-                            self._unmodified_size += response.size
-
-                            if mirror_paths:
-                                self.link_or_copy(target_path, *mirror_paths)
-
-                            self._downloaded.append(variant)
-                            self._missing_sources.difference_update(
-                                variant.get_all_paths()
-                            )
-
-                            return
-
-                        size = 0
-                        target_path.unlink(missing_ok=True)
-                        async with self._settings.aiofile_factory.open(
-                            target_path
-                        ) as fp:
-                            try:
-                                hashes: dict[HashType, HashObject] = {}
-                                for hash_type in variant.hashes:
-                                    if hash_type not in self._settings.check_hashes:
-                                        continue
-
-                                    hashes[hash_type] = hash_type.get_hash_function()()
-
-                                slow_rate_protector_factory = (
-                                    self._settings.slow_rate_protector_factory
+                            if is_last_source_path:
+                                should_retry = True
+                                retry_message = (
+                                    f"Server reported size {response.size} differs from"
+                                    f" expected size {expected_size} for file"
+                                    f" {source_path}. Retrying..."
                                 )
-                                slow_rate_protector = (
-                                    slow_rate_protector_factory.for_target(
-                                        variant.get_source_path()
+                            else:
+                                self._log.debug(
+                                    f"Server reported size {response.size} differs from"
+                                    f" expected size {expected_size} for {source_path}."
+                                    " Trying next available path."
+                                )
+                                break
+                        else:
+                            mirror_paths = [
+                                self._settings.target_root_path / path
+                                for path in variant.get_all_paths()
+                            ]
+
+                            if response.size and not self.need_update(
+                                target_path, response.size, response.date
+                            ):
+                                self._unmodified_count += 1
+                                self._unmodified_size += response.size
+
+                                if mirror_paths:
+                                    await asyncio.get_running_loop().run_in_executor(
+                                        self._get_hash_executor(),
+                                        self.link_or_copy,
+                                        target_path,
+                                        *mirror_paths,
                                     )
+
+                                self._downloaded.append(variant)
+                                completed_variants.append(variant)
+                                self._missing_sources.difference_update(
+                                    variant.get_all_paths()
                                 )
-                                async for chunk in response.stream():
-                                    if self._settings.rate_limiter:
-                                        await self._settings.rate_limiter.acquire(
-                                            min(
-                                                len(chunk),
-                                                self._settings.rate_limiter.max_rate,
+
+                                succeeded_by_hash_algo = self._get_by_hash_algorithm(
+                                    source_path
+                                )
+                                variant_success = True
+                                break
+
+                            size = 0
+                            hashes: dict[HashType, HashObject] = {}
+                            target_path.unlink(missing_ok=True)
+                            async with self._settings.aiofile_factory.open(
+                                target_path
+                            ) as fp:
+                                try:
+                                    for hash_type in variant.hashes:
+                                        if hash_type not in self._settings.check_hashes:
+                                            continue
+
+                                        hashes[hash_type] = (
+                                            hash_type.get_hash_function()()
+                                        )
+
+                                    slow_rate_protector_factory = (
+                                        self._settings.slow_rate_protector_factory
+                                    )
+                                    slow_rate_protector = (
+                                        slow_rate_protector_factory.for_target(
+                                            variant.get_source_path()
+                                        )
+                                    )
+                                    protector_pause = getattr(
+                                        slow_rate_protector, "pause", None
+                                    )
+                                    async with contextlib.aclosing(
+                                        response.stream()
+                                    ) as stream:
+                                        rate_limiter = self._settings.rate_limiter
+                                        async for chunk in stream:
+                                            if rate_limiter:
+                                                pause_start = datetime.now()
+                                                await rate_limiter.acquire(
+                                                    min(
+                                                        len(chunk),
+                                                        rate_limiter.max_rate,
+                                                    )
+                                                )
+                                                if protector_pause is not None:
+                                                    protector_pause(
+                                                        datetime.now() - pause_start
+                                                    )
+
+                                            size += len(chunk)
+                                            slow_rate_protector.rate(len(chunk))
+                                            write_start = datetime.now()
+                                            await fp.write(chunk)
+                                            if protector_pause is not None:
+                                                protector_pause(
+                                                    datetime.now() - write_start
+                                                )
+
+                                            for hash_function in hashes.values():
+                                                hash_function.update(chunk)
+
+                                    for hash_type, hash_function in hashes.items():
+                                        expected_hash = variant.hashes[
+                                            hash_type
+                                        ].hash.lower()
+                                        calculated_hash = (
+                                            hash_function.hexdigest().lower()
+                                        )
+
+                                        if expected_hash != calculated_hash:
+                                            raise HashMismatchException(
+                                                hash_type,
+                                                source_path,
+                                                expected_hash,
+                                                calculated_hash,
                                             )
+
+                                except HashMismatchException:
+                                    error = True
+                                    if is_last_source_path:
+                                        should_retry = True
+                                        retry_message = (
+                                            "Hash mismatch occurred while downloading "
+                                            f"file {source_path}. Retrying..."
                                         )
-
-                                    size += len(chunk)
-                                    slow_rate_protector.rate(len(chunk))
-                                    await fp.write(chunk)
-
-                                    for hash_function in hashes.values():
-                                        hash_function.update(chunk)
-
-                                for hash_type, hash_function in hashes.items():
-                                    expected_hash = variant.hashes[
-                                        hash_type
-                                    ].hash.lower()
-                                    calculated_hash = hash_function.hexdigest().lower()
-
-                                    if expected_hash != calculated_hash:
-                                        raise HashMismatchException(
-                                            hash_type,
-                                            source_path,
-                                            expected_hash,
-                                            calculated_hash,
+                                    else:
+                                        self._log.debug(
+                                            f"Hash mismatch for {source_path}. "
+                                            "Trying next available path."
                                         )
+                                        # Break to try next source_path
+                                        break
 
-                            except Exception as ex:  # pylint: disable=W0718
-                                await retry(
-                                    f"An error `{ex.__class__.__qualname__}: {ex}`"
-                                    f" occurred while downloading file {source_path}."
-                                    " Retrying..."
-                                )
-                                error = True
-                                continue
+                                except Exception as ex:  # pylint: disable=W0718
+                                    should_retry = True
+                                    retry_message = (
+                                        f"An error `{ex.__class__.__qualname__}: {ex}`"
+                                        " occurred while downloading file"
+                                        f" {source_path}. Retrying..."
+                                    )
+                                    error = True
 
-                        if expected_size > 0 and expected_size != size:
-                            await retry(
-                                f"Downloaded size {size} is differs from expected size"
-                                f" {expected_size} for file {source_path}. Retrying..."
+                            if not should_retry:
+                                if expected_size > 0 and expected_size != size:
+                                    error = True
+                                    if is_last_source_path:
+                                        should_retry = True
+                                        retry_message = (
+                                            f"Downloaded size {size} differs from"
+                                            f" expected size {expected_size} for file"
+                                            f" {source_path}. Retrying..."
+                                        )
+                                    else:
+                                        self._log.debug(
+                                            f"Size mismatch for {source_path}. "
+                                            "Trying next available path."
+                                        )
+                                        break
+                                else:
+                                    calculated_sums = {
+                                        ht: hf.hexdigest() for ht, hf in hashes.items()
+                                    }
+                                    needs_fsync = not (
+                                        isinstance(
+                                            self._settings.aiofile_factory,
+                                            AsyncIOFileFactory,
+                                        )
+                                        and hasattr(
+                                            self._settings.aiofile_factory, "_context"
+                                        )
+                                    )
+                                    resp_date = response.date
+
+                                    def _finalize_downloaded_file(
+                                        _target: Path = target_path,
+                                        _sums: dict[HashType, str] = calculated_sums,
+                                        _fsync: bool = needs_fsync,
+                                        _date: datetime | None = resp_date,
+                                        _mirror_paths: list[Path] = mirror_paths,
+                                    ) -> None:
+                                        if _fsync:
+                                            with (
+                                                contextlib.suppress(OSError),
+                                                open(_target, "ab") as f,
+                                            ):
+                                                os.fsync(f.fileno())
+
+                                        if _sums:
+                                            store_sums(_target, _sums)
+
+                                        if _date:
+                                            with contextlib.suppress(OSError):
+                                                os.utime(
+                                                    _target,
+                                                    (
+                                                        _date.timestamp(),
+                                                        _date.timestamp(),
+                                                    ),
+                                                )
+
+                                        if _mirror_paths:
+                                            self.link_or_copy(_target, *_mirror_paths)
+
+                                    await asyncio.get_running_loop().run_in_executor(
+                                        self._get_hash_executor(),
+                                        _finalize_downloaded_file,
+                                    )
+
+                                    self._downloaded_count += 1
+                                    self._downloaded_size += size
+
+                                    self._downloaded.append(variant)
+                                    completed_variants.append(variant)
+                                    self._missing_sources.difference_update(
+                                        variant.get_all_paths()
+                                    )
+                                    succeeded_by_hash_algo = (
+                                        self._get_by_hash_algorithm(source_path)
+                                    )
+                                    variant_success = True
+                                    break
+
+                    if should_retry:
+                        await retry(
+                            message=retry_message,
+                            skip_try=skip_try,
+                        )
+
+                if variant_success:
+                    if succeeded_by_hash_algo is not None:
+                        self._supported_by_hash_algos.add(succeeded_by_hash_algo)
+
+                    for failed_ht in failed_by_hash_algos:
+                        if failed_ht not in self._supported_by_hash_algos:
+                            self._unsupported_by_hash_algos.add(failed_ht)
+                            self._log.debug(
+                                f"By-hash algorithm {failed_ht.value} "
+                                "blacklisted (received 404)."
                             )
-                            error = True
-                            continue
+                    break
 
-                        if response.date:
-                            os.utime(
-                                target_path,
-                                (response.date.timestamp(), response.date.timestamp()),
-                            )
-
-                        if mirror_paths:
-                            self.link_or_copy(target_path, *mirror_paths)
-
-                        self._downloaded_count += 1
-                        self._downloaded_size += size
-
-                        self._downloaded.append(variant)
-                        self._missing_sources.difference_update(variant.get_all_paths())
-                        return
+        if any(
+            v in completed_variants
+            for v in source_file.compression_variants.values()
+            if len(v.get_all_paths()) > 0
+        ):
+            return
 
         if source_file.ignore_errors:
             self._log.info(f"Unable to download `{source_file.path}`: ignoring")
@@ -432,15 +882,18 @@ class Downloader(ABC):
             self._log.info(f"Optional file `{source_file.path}` is missing on server")
             return
 
+        missing_variants = [
+            v
+            for v in source_file.compression_variants.values()
+            if v not in completed_variants
+        ]
         self._missing_sources.update(
-            itertools.chain.from_iterable(
-                v.get_all_paths() for v in source_file.compression_variants.values()
-            )
+            itertools.chain.from_iterable(v.get_all_paths() for v in missing_variants)
         )
 
         if not error:
             self._missing_count += 1
-            self._missing_size += source_file.size
+            self._missing_size += sum(v.size for v in missing_variants)
 
             self._log.warning(
                 f"Unable to download {source_file.path}: file is missing on server"
@@ -448,7 +901,7 @@ class Downloader(ABC):
             return
 
         self._error_count += 1
-        self._error_size += source_file.size
+        self._error_size += sum(v.size for v in missing_variants)
 
         self._log.error(f"Unable to download {source_file.path}: no more tries")
 

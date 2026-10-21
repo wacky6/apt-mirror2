@@ -4,3 +4,6 @@
 contrib
 build
 dist
+venv/
+env/
+tmp_verify/

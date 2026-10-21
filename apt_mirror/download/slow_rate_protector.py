@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 from abc import ABCMeta, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from .format import format_size
@@ -15,6 +15,9 @@ class SlowRateException(RuntimeError):
 class BaseSlowRateProtector(metaclass=ABCMeta):
     @abstractmethod
     def rate(self, count: int): ...
+
+    def pause(self, delta: timedelta) -> None:  # noqa: B027
+        pass
 
 
 class DummySlowRateProtector(BaseSlowRateProtector):
@@ -32,11 +35,15 @@ class SlowRateProtector(BaseSlowRateProtector):
 
         self._count = 0
 
+    def pause(self, delta: timedelta) -> None:
+        if delta.total_seconds() > 0:
+            self._startup += delta
+
     def rate(self, count: int):
-        passed = (datetime.now() - self._startup).seconds
+        passed = int((datetime.now() - self._startup).total_seconds())
         self._count += count
 
-        if not passed or passed < self._rate_startup:
+        if passed <= 0 or passed < self._rate_startup:
             return
 
         rate = self._count / passed

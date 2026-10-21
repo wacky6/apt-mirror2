@@ -2,7 +2,7 @@
 
 import hashlib
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Protocol, overload
@@ -114,6 +114,43 @@ class DownloadFileCompressionVariant:
 
         return paths
 
+    def get_prioritized_source_paths(
+        self,
+        enabled_hashes: set[HashType],
+        unsupported_by_hash_algos: set[HashType],
+    ) -> Sequence[Path]:
+        paths: list[Path] = []
+
+        if self.use_by_hash:
+            # 1. Try "Strong/Reliable" By-Hash first (SHA512, SHA256)
+            # only if not blacklisted for this session.
+            for hash_type in (HashType.SHA512, HashType.SHA256):
+                if (
+                    hash_type in self.hashes
+                    and hash_type in enabled_hashes
+                    and hash_type not in unsupported_by_hash_algos
+                ):
+                    paths.append(self._get_hashed_path(hash_type))
+
+        # 2. Try Traditional Path
+        paths.append(self.path)
+
+        if self.use_by_hash:
+            # 3. Try "Other" By-Hash (SHA1, MD5) as last resort
+            # only if not blacklisted.
+            for hash_type in (HashType.SHA1, HashType.MD5):
+                if (
+                    hash_type in self.hashes
+                    and hash_type in enabled_hashes
+                    and hash_type not in unsupported_by_hash_algos
+                ):
+                    # Avoid duplicates
+                    hashed_path = self._get_hashed_path(hash_type)
+                    if hashed_path not in paths:
+                        paths.append(hashed_path)
+
+        return paths
+
 
 @dataclass
 class DownloadFile:
@@ -125,6 +162,7 @@ class DownloadFile:
     check_utime: bool = False
     ignore_errors: bool = False
     ignore_missing: bool = False
+    init_default_variant: InitVar[bool] = True
 
     @staticmethod
     def uncompressed_path(path: Path):
@@ -147,7 +185,10 @@ class DownloadFile:
         hash_sum: HashSum,
         use_by_hash: bool,
     ):
-        download_file = DownloadFile.from_path(cls.uncompressed_path(path))
+        download_file = cls(
+            path=cls.uncompressed_path(path),
+            init_default_variant=False,
+        )
         download_file.add_compression_variant(
             path=path,
             size=size,
@@ -157,8 +198,8 @@ class DownloadFile:
 
         return download_file
 
-    def __post_init__(self):
-        if not self.compression_variants:
+    def __post_init__(self, init_default_variant: bool = True):
+        if init_default_variant and not self.compression_variants:
             self.add_compression_variant(self.path, size=0)
 
     def add_compression_variant(
