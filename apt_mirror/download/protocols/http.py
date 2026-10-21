@@ -83,6 +83,7 @@ class HTTPDownloader(Downloader):
 
     async def aclose(self):
         await self._httpx.aclose()
+        await super().aclose()
 
     def aiter_bytes(self, response: httpx.Response):
         def func():
